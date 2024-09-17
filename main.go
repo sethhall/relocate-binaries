@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"flag"
 	"fmt"
 	"io"
@@ -12,10 +14,16 @@ import (
 )
 
 var (
-	binaries    []string
-	helpFlag    bool
-	verboseFlag bool
-	sensorDir   string
+	binaries      []string
+	helpFlag      bool
+	verboseFlag   bool
+	sensorDir     string
+	archiveFlag   bool
+	outputDir     string
+	externalTools = map[string][]string{
+		"darwin": {"otool", "install_name_tool"},
+		"linux":  {"ldd", "patchelf"},
+	}
 )
 
 func init() {
@@ -25,6 +33,8 @@ func init() {
 	})
 	flag.BoolVar(&helpFlag, "help", false, "Display help information")
 	flag.BoolVar(&verboseFlag, "v", false, "Enable verbose output")
+	flag.BoolVar(&archiveFlag, "archive", false, "Create a compressed archive of the final bundle")
+	flag.StringVar(&outputDir, "output", "sensor", "Specify the output directory")
 	flag.Usage = usage
 }
 
@@ -32,20 +42,26 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Sensor Setup Tool
 
 This program packages specified binaries along with their dependencies into a 'sensor' directory.
+
 It copies the binaries, their shared libraries, and sets up the correct RPATH.
 
 Usage:
-  %s -p <binary1> [-p <binary2> ...] [-v]
+
+  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>]
 
 Flags:
+
 `, os.Args[0])
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, `
-Examples:
-  %s -p zeek -p suricata
-  %s -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v
 
-The program will create a 'sensor' directory in the current working directory with the following structure:
+Examples:
+
+  %s -p zeek -p suricata
+  %s -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor
+
+The program will create a 'sensor' directory (or the specified output directory) with the following structure:
+
   sensor/
     ├── bin/
     │   ├── binary1
@@ -54,6 +70,7 @@ The program will create a 'sensor' directory in the current working directory wi
         └── (shared libraries)
 
 Note: This program may need to be run with elevated privileges to access certain system libraries.
+
 `, os.Args[0], os.Args[0])
 }
 
@@ -75,8 +92,14 @@ func main() {
 		fmt.Println("Verbose mode enabled")
 	}
 
+	// Check for external tools
+	if err := checkExternalTools(); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	var err error
-	sensorDir, err = filepath.Abs("sensor")
+	sensorDir, err = filepath.Abs(outputDir)
 	if err != nil {
 		fmt.Printf("Error getting absolute path for sensor directory: %v\n", err)
 		return
@@ -131,7 +154,82 @@ func main() {
 		}
 	}
 
+	if archiveFlag {
+		err := createArchive()
+		if err != nil {
+			fmt.Printf("Error creating archive: %v\n", err)
+		} else {
+			fmt.Println("Archive created successfully.")
+		}
+	}
+
 	fmt.Println("All operations completed.")
+}
+
+func checkExternalTools() error {
+	tools, ok := externalTools[runtime.GOOS]
+	if !ok {
+		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	}
+
+	for _, tool := range tools {
+		_, err := exec.LookPath(tool)
+		if err != nil {
+			return fmt.Errorf("required tool '%s' not found in PATH", tool)
+		}
+	}
+
+	return nil
+}
+
+func createArchive() error {
+	archiveName := fmt.Sprintf("%s.tar.gz", outputDir)
+	file, err := os.Create(archiveName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	gzw := gzip.NewWriter(file)
+	defer gzw.Close()
+
+	tw := tar.NewWriter(gzw)
+	defer tw.Close()
+
+	return filepath.Walk(sensorDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		header, err := tar.FileInfoHeader(info, info.Name())
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(filepath.Dir(sensorDir), path)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			_, err = io.Copy(tw, file)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 func copyBinaryAndLibs(binary string) error {
