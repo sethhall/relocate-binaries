@@ -385,8 +385,14 @@ func copyFileWithIO(src, dst string) error {
 		return fmt.Errorf("error setting destination file mode: %v", err)
 	}
 
+	// Set writable permissions
+	err = os.Chmod(dst, 0755)
+	if err != nil {
+		return fmt.Errorf("error setting file permissions: %v", err)
+	}
+
 	if verboseFlag {
-		fmt.Printf("Successfully copied: %s to %s\n", src, dst)
+		fmt.Printf("Successfully copied and set permissions: %s to %s\n", src, dst)
 	}
 
 	return nil
@@ -429,23 +435,57 @@ func addRPATHMacOS(path string) error {
 }
 
 func addRPATHLinux(path string) error {
-	cmd := exec.Command("patchelf", "--print-rpath", path)
+	// Check if the file is an ELF binary or shared library
+	cmd := exec.Command("file", path)
 	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("error checking file type for %s: %v", path, err)
+	}
+	if !strings.Contains(string(output), "ELF") {
+		if verboseFlag {
+			fmt.Printf("Skipping non-ELF file: %s\n", path)
+		}
+		return nil
+	}
+
+	// Ensure the file is writable
+	err = os.Chmod(path, 0755)
+	if err != nil {
+		return fmt.Errorf("error setting file permissions for %s: %v", path, err)
+	}
+
+	// Check current RPATH
+	cmd = exec.Command("patchelf", "--print-rpath", path)
+	output, err = cmd.Output()
 	if err != nil {
 		return fmt.Errorf("error checking RPATH for %s: %v", path, err)
 	}
 
-	if !strings.Contains(string(output), "$ORIGIN/../lib") {
-		cmd = exec.Command("patchelf", "--set-rpath", "$ORIGIN/../lib", path)
-		err = cmd.Run()
-		if err != nil {
-			return fmt.Errorf("failed to add RPATH for %s: %v", path, err)
-		}
+	currentRpath := strings.TrimSpace(string(output))
+	newRpath := "$ORIGIN/../lib"
+
+	if currentRpath == "" {
+		// Set RPATH if it doesn't exist
+		cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
+	} else if !strings.Contains(currentRpath, newRpath) {
+		// Append to existing RPATH if it doesn't already contain the new path
+		newRpath = currentRpath + ":" + newRpath
+		cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
+	} else {
+		// RPATH already contains the desired path
 		if verboseFlag {
-			fmt.Printf("Added RPATH to: %s\n", path)
+			fmt.Printf("RPATH already set correctly for: %s\n", path)
 		}
-	} else if verboseFlag {
-		fmt.Printf("RPATH already exists for: %s\n", path)
+		return nil
+	}
+
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to add RPATH for %s: %v\nOutput: %s", path, err, string(output))
+	}
+
+	if verboseFlag {
+		fmt.Printf("Added/Updated RPATH for: %s\n", path)
 	}
 
 	return nil
