@@ -62,6 +62,7 @@ Examples:
 ./relocate-binaries -p /usr/bin/python3
 ./relocate-binaries -p /usr/bin/nginx -p /usr/sbin/php-fpm -v
 ./relocate-binaries -config config.txt
+```
 
 ## Output
 
@@ -79,16 +80,6 @@ output/
 └── (other necessary files or directories)
 ```
 
-## Configuration File Format
-
-The configuration file should contain one file or glob pattern per line. Each line defines a file or set of files to copy into the output directory. For example:
-
-```
-/nix/store/fcxn3had3f3vfmaj2lfag282gkdn2pkb-zeek-6.2.0/share/zeek/base/*
-```
-
-This will copy all files and directories under that path into the output directory, preserving the directory structure.
-
 ## How It Works
 
 1. The tool analyzes the specified binaries to identify all required shared libraries.
@@ -99,7 +90,7 @@ This will copy all files and directories under that path into the output directo
 
 ## Use Cases
 
-- Creating fully self-contained applications for containerized environments
+- Creating fully self-contained applications for minimal containerized environments
 - Deploying applications to systems with unknown or minimal library availability
 - Ensuring consistent library versions across different deployment environments
 - Isolating applications from system library changes
