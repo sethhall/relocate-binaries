@@ -200,7 +200,7 @@ func main() {
 
 func checkExternalTools() error {
 	tools, ok := externalTools[runtime.GOOS]
-	if (!ok) {
+	if !ok {
 		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
 
@@ -412,15 +412,20 @@ func addRPATHLinux(path string) error {
 	}
 
 	// Set relative RPATH
-	newRpath := "$ORIGIN/../lib"
-	cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to set RPATH for %s: %v\nOutput: %s", path, err, string(output))
-	}
+	// Get the base name of the file
+	baseName := filepath.Base(path)
+	// Check if the file is an ld-linux library (we don't want to mess with rpath in that case)
+	if !strings.HasPrefix(baseName, "ld-linux") {
+		newRpath := "$ORIGIN/../lib"
+		cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to set RPATH for %s: %v\nOutput: %s", path, err, string(output))
+		}
+		if verboseFlag {
+			fmt.Printf("Set RPATH to %s for: %s\n", newRpath, path)
+		}
 
-	if verboseFlag {
-		fmt.Printf("Set RPATH to %s for: %s\n", newRpath, path)
 	}
 
 	return nil
