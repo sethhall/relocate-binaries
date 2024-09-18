@@ -251,28 +251,37 @@ func copySharedLibraries(binaryPath string) error {
 	}
 
 	lines := strings.Split(string(output), "\n")
+	missingLibraries := []string{}
 	for _, line := range lines {
 		if strings.Contains(line, "=>") {
 			parts := strings.Fields(line)
-			if len(parts) >= 3 && parts[2] != "not" {
-				libPath := parts[2]
-				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-				err := copyFileWithIO(libPath, destPath)
-				if err != nil {
-					fmt.Printf("Warning: Failed to copy %s: %v\n", libPath, err)
+			if len(parts) >= 3 {
+				if parts[2] == "not" {
+					missingLibraries = append(missingLibraries, parts[0])
 				} else {
-					if verboseFlag {
-						fmt.Printf("Copied: %s to %s\n", libPath, destPath)
-					}
-
-					// Set RPATH for the copied library
-					err = addRPATHLinux(destPath)
+					libPath := parts[2]
+					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
+					err := copyFileWithIO(libPath, destPath)
 					if err != nil {
-						fmt.Printf("Warning: Failed to set RPATH for %s: %v\n", destPath, err)
+						fmt.Printf("Warning: Failed to copy %s: %v\n", libPath, err)
+					} else {
+						if verboseFlag {
+							fmt.Printf("Copied: %s to %s\n", libPath, destPath)
+						}
+
+						// Set RPATH for the copied library
+						err = addRPATHLinux(destPath)
+						if err != nil {
+							fmt.Printf("Warning: Failed to set RPATH for %s: %v\n", destPath, err)
+						}
 					}
 				}
 			}
 		}
+	}
+
+	if len(missingLibraries) > 0 {
+		return fmt.Errorf("missing libraries: %v", missingLibraries)
 	}
 
 	return nil
@@ -283,7 +292,7 @@ func isSystemLibrary(path string) bool {
 		"/usr/lib",
 		"/System/Library",
 	}
-	for _, sysPath := range systemPaths {
+	for _, sysPath := systemPaths {
 		if strings.HasPrefix(path, sysPath) {
 			return true
 		}
