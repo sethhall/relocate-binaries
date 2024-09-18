@@ -40,7 +40,7 @@ Run the tool with the following command:
 ```sh
 Usage:
 
-  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-config <config-file>] [-f]
+  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-f]
 
 Flags:
 
@@ -55,14 +55,11 @@ Flags:
   -p value
         Specify a binary to package (can be used multiple times)
   -v    Enable verbose output
-  -config string
-        Specify the configuration file path```
+```
 
 Examples:
 ./relocate-binaries -p /usr/bin/python3
 ./relocate-binaries -p /usr/bin/nginx -p /usr/sbin/php-fpm -v
-./relocate-binaries -config config.txt
-```
 
 ## Output
 
