@@ -1,4 +1,4 @@
-.PHONY: build run test clean
+.PHONY: build
 
 build:
 	go build -o relocate-binaries main.go

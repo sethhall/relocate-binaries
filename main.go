@@ -14,15 +14,15 @@ import (
 )
 
 var (
-	binaries      []string
-	helpFlag      bool
-	verboseFlag   bool
-	sensorDir     string
-	archiveFlag   bool
-	outputDir     string
-	externalTools = map[string][]string{
+	binaries         []string
+	helpFlag         bool
+	verboseFlag      bool
+	archiveFlag      bool
+	outputDir        string
+	finalInstallPath string
+	externalTools    = map[string][]string{
 		"darwin": {"otool", "install_name_tool"},
-		"linux":  {"ldd", "patchelf"},
+		"linux":  {"ldd", "patchelf", "file"},
 	}
 )
 
@@ -34,7 +34,8 @@ func init() {
 	flag.BoolVar(&helpFlag, "help", false, "Display help information")
 	flag.BoolVar(&verboseFlag, "v", false, "Enable verbose output")
 	flag.BoolVar(&archiveFlag, "archive", false, "Create a compressed archive of the final bundle")
-	flag.StringVar(&outputDir, "output", "sensor", "Specify the output directory")
+	flag.StringVar(&outputDir, "output", "output", "Specify the output directory")
+	flag.StringVar(&finalInstallPath, "install-path", "", "Specify the final installation path for the package")
 	flag.Usage = usage
 }
 
@@ -47,7 +48,7 @@ It copies the binaries, their shared libraries, and sets up the correct RPATH.
 
 Usage:
 
-  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>]
+  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>]
 
 Flags:
 
@@ -58,7 +59,7 @@ Flags:
 Examples:
 
   %s -p zeek -p suricata
-  %s -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor
+  %s -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor -install-path /opt/sensor
 
 The program will create a 'sensor' directory (or the specified output directory) with the following structure:
 
@@ -68,6 +69,8 @@ The program will create a 'sensor' directory (or the specified output directory)
     │   └── binary2
     └── lib/
         └── (shared libraries)
+
+If --install-path is specified, the binaries will be configured to work when installed at that location.
 
 Note: This program may need to be run with elevated privileges to access certain system libraries.
 
@@ -92,6 +95,12 @@ func main() {
 		fmt.Println("Verbose mode enabled")
 	}
 
+	if finalInstallPath == "" {
+		fmt.Println("Warning: No final installation path specified. The package may not be fully standalone.")
+	} else {
+		fmt.Printf("Final installation path set to: %s\n", finalInstallPath)
+	}
+
 	// Check for external tools
 	if err := checkExternalTools(); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -99,19 +108,19 @@ func main() {
 	}
 
 	var err error
-	sensorDir, err = filepath.Abs(outputDir)
+	outputDir, err = filepath.Abs(outputDir)
 	if err != nil {
 		fmt.Printf("Error getting absolute path for sensor directory: %v\n", err)
 		return
 	}
 
 	// Create directories
-	err = os.MkdirAll(filepath.Join(sensorDir, "bin"), 0755)
+	err = os.MkdirAll(filepath.Join(outputDir, "bin"), 0755)
 	if err != nil {
 		fmt.Printf("Error creating sensor/bin directory: %v\n", err)
 		return
 	}
-	err = os.MkdirAll(filepath.Join(sensorDir, "lib"), 0755)
+	err = os.MkdirAll(filepath.Join(outputDir, "lib"), 0755)
 	if err != nil {
 		fmt.Printf("Error creating sensor/lib directory: %v\n", err)
 		return
@@ -125,9 +134,16 @@ func main() {
 		}
 	}
 
+	// Set permissions recursively
+	err = setPermissionsRecursively(outputDir)
+	if err != nil {
+		fmt.Printf("Error setting permissions: %v\n", err)
+		return
+	}
+
 	// Update RPATH and relocate libraries
 	for _, dir := range []string{"bin", "lib"} {
-		err = filepath.Walk(filepath.Join(sensorDir, dir), func(path string, info os.FileInfo, err error) error {
+		err = filepath.Walk(filepath.Join(outputDir, dir), func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
@@ -173,63 +189,16 @@ func checkExternalTools() error {
 	}
 
 	for _, tool := range tools {
-		_, err := exec.LookPath(tool)
+		path, err := exec.LookPath(tool)
 		if err != nil {
 			return fmt.Errorf("required tool '%s' not found in PATH", tool)
+		}
+		if verboseFlag {
+			fmt.Printf("Found %s at: %s\n", tool, path)
 		}
 	}
 
 	return nil
-}
-
-func createArchive() error {
-	archiveName := fmt.Sprintf("%s.tar.gz", outputDir)
-	file, err := os.Create(archiveName)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	gzw := gzip.NewWriter(file)
-	defer gzw.Close()
-
-	tw := tar.NewWriter(gzw)
-	defer tw.Close()
-
-	return filepath.Walk(sensorDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		header, err := tar.FileInfoHeader(info, info.Name())
-		if err != nil {
-			return err
-		}
-
-		relPath, err := filepath.Rel(filepath.Dir(sensorDir), path)
-		if err != nil {
-			return err
-		}
-		header.Name = relPath
-
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-
-		if !info.IsDir() {
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			_, err = io.Copy(tw, file)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
 }
 
 func copyBinaryAndLibs(binary string) error {
@@ -246,70 +215,66 @@ func copyBinaryAndLibs(binary string) error {
 	}
 
 	// Copy the binary to final location
-	destPath := filepath.Join(sensorDir, "bin", filepath.Base(binaryPath))
+	destPath := filepath.Join(outputDir, "bin", filepath.Base(binaryPath))
 	err = copyFileWithIO(binaryPath, destPath)
 	if err != nil {
 		return fmt.Errorf("error copying binary %s: %v", binary, err)
 	}
+
 	if verboseFlag {
 		fmt.Printf("Copied binary: %s to %s\n", binaryPath, destPath)
 	}
 
 	// Copy shared libraries
-	return copySharedLibraries(binaryPath)
+	err = copySharedLibraries(binaryPath)
+	if err != nil {
+		return fmt.Errorf("error copying shared libraries for %s: %v", binary, err)
+	}
+
+	// Set RPATH for the copied binary
+	err = addRPATHLinux(destPath)
+	if err != nil {
+		return fmt.Errorf("error setting RPATH for %s: %v", destPath, err)
+	}
+
+	return nil
 }
 
 func copySharedLibraries(binaryPath string) error {
-	var output []byte
-	var err error
-
 	if verboseFlag {
 		fmt.Printf("Copying shared libraries for: %s\n", binaryPath)
 	}
 
-	if runtime.GOOS == "darwin" {
-		output, err = exec.Command("otool", "-L", binaryPath).Output()
-	} else {
-		output, err = exec.Command("ldd", binaryPath).Output()
-	}
-
+	output, err := exec.Command("ldd", binaryPath).Output()
 	if err != nil {
 		return fmt.Errorf("error listing shared libraries: %v", err)
 	}
 
 	lines := strings.Split(string(output), "\n")
-	for i, line := range lines {
-		// Skip the first line on macOS as it's the binary itself
-		if runtime.GOOS == "darwin" && i == 0 {
-			continue
-		}
+	for _, line := range lines {
+		if strings.Contains(line, "=>") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 && parts[2] != "not" {
+				libPath := parts[2]
+				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
+				err := copyFileWithIO(libPath, destPath)
+				if err != nil {
+					fmt.Printf("Warning: Failed to copy %s: %v\n", libPath, err)
+				} else {
+					if verboseFlag {
+						fmt.Printf("Copied: %s to %s\n", libPath, destPath)
+					}
 
-		var libPath string
-		if runtime.GOOS == "darwin" {
-			if strings.Contains(line, "/") {
-				libPath = strings.Fields(strings.TrimSpace(line))[0]
-				if isSystemLibrary(libPath) {
-					continue
+					// Set RPATH for the copied library
+					err = addRPATHLinux(destPath)
+					if err != nil {
+						fmt.Printf("Warning: Failed to set RPATH for %s: %v\n", destPath, err)
+					}
 				}
-			}
-		} else {
-			if strings.Contains(line, "=>") && !strings.Contains(line, "linux-vdso.so") {
-				parts := strings.Fields(line)
-				if len(parts) >= 3 {
-					libPath = parts[2]
-				}
-			}
-		}
-		if libPath != "" && libPath != binaryPath {
-			destPath := filepath.Join(sensorDir, "lib", filepath.Base(libPath))
-			err := copyFileWithIO(libPath, destPath)
-			if err != nil {
-				fmt.Printf("Warning: Failed to copy %s: %v\n", libPath, err)
-			} else if verboseFlag {
-				fmt.Printf("Copied: %s to %s\n", libPath, destPath)
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -380,19 +345,98 @@ func copyFileWithIO(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("error getting source file info: %v", err)
 	}
-	err = os.Chmod(dst, srcInfo.Mode())
-	if err != nil {
-		return fmt.Errorf("error setting destination file mode: %v", err)
-	}
 
-	// Set writable permissions
-	err = os.Chmod(dst, 0755)
+	err = os.Chmod(dst, srcInfo.Mode())
 	if err != nil {
 		return fmt.Errorf("error setting file permissions: %v", err)
 	}
 
 	if verboseFlag {
-		fmt.Printf("Successfully copied and set permissions: %s to %s\n", src, dst)
+		fmt.Printf("Successfully copied: %s to %s\n", src, dst)
+	}
+
+	return nil
+}
+
+func addRPATHLinux(path string) error {
+	// Check if the file is an ELF binary or shared library
+	cmd := exec.Command("file", path)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("error checking file type for %s: %v", path, err)
+	}
+	if !strings.Contains(string(output), "ELF") {
+		if verboseFlag {
+			fmt.Printf("Skipping non-ELF file: %s\n", path)
+		}
+		return nil
+	}
+
+	// Ensure the file is writable
+	err = os.Chmod(path, 0755)
+	if err != nil {
+		return fmt.Errorf("error setting file permissions for %s: %v", path, err)
+	}
+
+	// Update the interpreter path only for executables
+	if strings.Contains(string(output), "executable") {
+		err = updateInterpreterPath(path)
+		if err != nil {
+			return fmt.Errorf("failed to update interpreter path for %s: %v", path, err)
+		}
+	}
+
+	// Set relative RPATH
+	newRpath := "$ORIGIN/../lib"
+	cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to set RPATH for %s: %v\nOutput: %s", path, err, string(output))
+	}
+
+	if verboseFlag {
+		fmt.Printf("Set RPATH to %s for: %s\n", newRpath, path)
+	}
+
+	return nil
+}
+
+func updateInterpreterPath(path string) error {
+	if finalInstallPath == "" {
+		return nil // No need to update if final install path is not specified
+	}
+
+	// Find the ld-linux.so in our lib directory
+	ldLinuxPath := ""
+	err := filepath.Walk(filepath.Join(outputDir, "lib"), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(filepath.Base(path), "ld-linux") {
+			ldLinuxPath = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error finding ld-linux.so: %v", err)
+	}
+	if ldLinuxPath == "" {
+		return fmt.Errorf("ld-linux.so not found in lib directory")
+	}
+
+	// Calculate the final path of ld-linux.so
+	finalLdLinuxPath := filepath.Join(finalInstallPath, "lib", filepath.Base(ldLinuxPath))
+
+	// Update the interpreter path
+	cmd := exec.Command("patchelf", "--set-interpreter", finalLdLinuxPath, path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to set interpreter for %s: %v\nOutput: %s", path, err, string(output))
+	}
+
+	if verboseFlag {
+		fmt.Printf("Updated interpreter path to %s for: %s\n", finalLdLinuxPath, path)
 	}
 
 	return nil
@@ -419,7 +463,7 @@ func addRPATHMacOS(path string) error {
 	}
 
 	// Also add the absolute path to the lib directory
-	absLibPath := filepath.Join(sensorDir, "lib")
+	absLibPath := filepath.Join(outputDir, "lib")
 	if !strings.Contains(string(output), absLibPath) {
 		cmd = exec.Command("install_name_tool", "-add_rpath", absLibPath, path)
 		err = cmd.Run()
@@ -429,63 +473,6 @@ func addRPATHMacOS(path string) error {
 		if verboseFlag {
 			fmt.Printf("Added absolute RPATH to: %s\n", path)
 		}
-	}
-
-	return nil
-}
-
-func addRPATHLinux(path string) error {
-	// Check if the file is an ELF binary or shared library
-	cmd := exec.Command("file", path)
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("error checking file type for %s: %v", path, err)
-	}
-	if !strings.Contains(string(output), "ELF") {
-		if verboseFlag {
-			fmt.Printf("Skipping non-ELF file: %s\n", path)
-		}
-		return nil
-	}
-
-	// Ensure the file is writable
-	err = os.Chmod(path, 0755)
-	if err != nil {
-		return fmt.Errorf("error setting file permissions for %s: %v", path, err)
-	}
-
-	// Check current RPATH
-	cmd = exec.Command("patchelf", "--print-rpath", path)
-	output, err = cmd.Output()
-	if err != nil {
-		return fmt.Errorf("error checking RPATH for %s: %v", path, err)
-	}
-
-	currentRpath := strings.TrimSpace(string(output))
-	newRpath := "$ORIGIN/../lib"
-
-	if currentRpath == "" {
-		// Set RPATH if it doesn't exist
-		cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
-	} else if !strings.Contains(currentRpath, newRpath) {
-		// Append to existing RPATH if it doesn't already contain the new path
-		newRpath = currentRpath + ":" + newRpath
-		cmd = exec.Command("patchelf", "--set-rpath", newRpath, path)
-	} else {
-		// RPATH already contains the desired path
-		if verboseFlag {
-			fmt.Printf("RPATH already set correctly for: %s\n", path)
-		}
-		return nil
-	}
-
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to add RPATH for %s: %v\nOutput: %s", path, err, string(output))
-	}
-
-	if verboseFlag {
-		fmt.Printf("Added/Updated RPATH for: %s\n", path)
 	}
 
 	return nil
@@ -515,9 +502,8 @@ func updateMacOSLibPaths(binaryPath string) error {
 					} else if verboseFlag {
 						fmt.Printf("Updated library path: %s to %s in %s\n", libPath, newPath, binaryPath)
 					}
-
 					// Copy the library if it's not already in the lib directory
-					destPath := filepath.Join(sensorDir, "lib", filepath.Base(libPath))
+					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
 					if _, err := os.Stat(destPath); os.IsNotExist(err) {
 						err := copyFileWithIO(libPath, destPath)
 						if err != nil {
@@ -563,7 +549,7 @@ func processLibrariesRecursively(libPath string) error {
 			if len(parts) > 0 {
 				depLibPath := parts[0]
 				if !isSystemLibrary(depLibPath) {
-					destPath := filepath.Join(sensorDir, "lib", filepath.Base(depLibPath))
+					destPath := filepath.Join(outputDir, "lib", filepath.Base(depLibPath))
 					if _, err := os.Stat(destPath); os.IsNotExist(err) {
 						err := copyFileWithIO(depLibPath, destPath)
 						if err != nil {
@@ -579,6 +565,67 @@ func processLibrariesRecursively(libPath string) error {
 			}
 		}
 	}
-
 	return nil
+}
+
+func setPermissionsRecursively(dir string) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return os.Chmod(path, 0755)
+		}
+		return os.Chmod(path, 0755)
+	})
+}
+
+func createArchive() error {
+	archiveName := fmt.Sprintf("%s.tar.gz", outputDir)
+	file, err := os.Create(archiveName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	gzw := gzip.NewWriter(file)
+	defer gzw.Close()
+
+	tw := tar.NewWriter(gzw)
+	defer tw.Close()
+
+	return filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		header, err := tar.FileInfoHeader(info, info.Name())
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(filepath.Dir(outputDir), path)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			_, err = io.Copy(tw, file)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
