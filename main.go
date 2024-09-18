@@ -712,10 +712,15 @@ func buildAndInstallWrapper() error {
 
 	// Build the wrapper executable
 	wrapperExecutablePath := filepath.Join(outputDir, "bin", "wrapper")
-	cmd := exec.Command("gcc", "-o", wrapperExecutablePath, wrapperFilePath)
+	cmd := exec.Command("gcc", "-static", "-o", wrapperExecutablePath, wrapperFilePath)
 	err = cmd.Run()
 	if err != nil {
-		return fmt.Errorf("error building wrapper executable: %v", err)
+		// Try building with clang if gcc fails
+		cmd = exec.Command("clang", "-static", "-o", wrapperExecutablePath, wrapperFilePath)
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("error building wrapper executable with both gcc and clang: %v", err)
+		}
 	}
 
 	if verboseFlag {
