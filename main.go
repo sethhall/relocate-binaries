@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"embed"
 	"flag"
 	"fmt"
 	"io"
@@ -26,6 +27,9 @@ var (
 		"linux":  {"ldd", "patchelf", "file"},
 	}
 )
+
+//go:embed wrapper.c
+var wrapperSource embed.FS
 
 func init() {
 	flag.Func("p", "Specify a binary to package (can be used multiple times)", func(s string) error {
@@ -195,6 +199,15 @@ func main() {
 		}
 	}
 
+	// Build and install the wrapper tool on Linux
+	if runtime.GOOS == "linux" {
+		err := buildAndInstallWrapper()
+		if err != nil {
+			fmt.Printf("Error building and installing wrapper: %v\n", err)
+			return
+		}
+	}
+
 	fmt.Println("All operations completed.")
 }
 
@@ -251,6 +264,14 @@ func copyBinaryAndLibs(binary string) error {
 	err = addRPATHLinux(destPath)
 	if err != nil {
 		return fmt.Errorf("error setting RPATH for %s: %v", destPath, err)
+	}
+
+	// Rename the original executable with a dot prefix and create a symlink to the wrapper tool on Linux
+	if runtime.GOOS == "linux" {
+		err = renameAndCreateSymlink(destPath)
+		if err != nil {
+			return fmt.Errorf("error renaming and creating symlink for %s: %v", destPath, err)
+		}
 	}
 
 	return nil
@@ -344,7 +365,7 @@ func copyFileWithIO(src, dst string) error {
 	// If it's a symlink, read the link and copy the target
 	if fileInfo.Mode()&os.ModeSymlink != 0 {
 		linkTarget, err := os.Readlink(src)
-		if err != nil {
+		if (err != nil) {
 			return fmt.Errorf("error reading symlink: %v", err)
 		}
 		// If the link is relative, make it absolute
@@ -658,4 +679,65 @@ func createArchive() error {
 
 		return nil
 	})
+}
+
+func buildAndInstallWrapper() error {
+	// Create a temporary directory for the wrapper source code
+	tempDir, err := os.MkdirTemp("", "wrapper")
+	if err != nil {
+		return fmt.Errorf("error creating temporary directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Write the wrapper source code to a file
+	wrapperSourceData, err := wrapperSource.ReadFile("wrapper.c")
+	if err != nil {
+		return fmt.Errorf("error reading embedded wrapper source code: %v", err)
+	}
+
+	wrapperFilePath := filepath.Join(tempDir, "wrapper.c")
+	err = os.WriteFile(wrapperFilePath, wrapperSourceData, 0644)
+	if err != nil {
+		return fmt.Errorf("error writing wrapper source code: %v", err)
+	}
+
+	// Build the wrapper executable
+	wrapperExecutablePath := filepath.Join(outputDir, "bin", "wrapper")
+	cmd := exec.Command("gcc", "-o", wrapperExecutablePath, wrapperFilePath)
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("error building wrapper executable: %v", err)
+	}
+
+	if verboseFlag {
+		fmt.Printf("Built wrapper executable: %s\n", wrapperExecutablePath)
+	}
+
+	return nil
+}
+
+func renameAndCreateSymlink(executablePath string) error {
+	dir := filepath.Dir(executablePath)
+	baseName := filepath.Base(executablePath)
+	dotPrefixedName := "." + baseName
+	dotPrefixedPath := filepath.Join(dir, dotPrefixedName)
+
+	// Rename the original executable with a dot prefix
+	err := os.Rename(executablePath, dotPrefixedPath)
+	if err != nil {
+		return fmt.Errorf("error renaming executable: %v", err)
+	}
+
+	// Create a symlink to the wrapper tool
+	wrapperPath := filepath.Join(dir, "wrapper")
+	err = os.Symlink(wrapperPath, executablePath)
+	if err != nil {
+		return fmt.Errorf("error creating symlink to wrapper: %v", err)
+	}
+
+	if verboseFlag {
+		fmt.Printf("Renamed executable to: %s and created symlink to wrapper: %s\n", dotPrefixedPath, executablePath)
+	}
+
+	return nil
 }
