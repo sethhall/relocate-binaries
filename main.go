@@ -142,7 +142,7 @@ func main() {
 		return
 	}
 
-		// Build and install the wrapper tool on Linux
+	// Build and install the wrapper tool on Linux
 	if runtime.GOOS == "linux" {
 		err := buildAndInstallWrapper()
 		if err != nil {
@@ -150,7 +150,6 @@ func main() {
 			return
 		}
 	}
-
 
 	// Copy specified binaries and their shared libraries
 	for _, binary := range binaries {
@@ -372,7 +371,7 @@ func copyFileWithIO(src, dst string) error {
 	// If it's a symlink, read the link and copy the target
 	if fileInfo.Mode()&os.ModeSymlink != 0 {
 		linkTarget, err := os.Readlink(src)
-		if (err != nil) {
+		if err != nil {
 			return fmt.Errorf("error reading symlink: %v", err)
 		}
 		// If the link is relative, make it absolute
@@ -713,11 +712,11 @@ func buildAndInstallWrapper() error {
 
 	// Build the wrapper executable
 	wrapperExecutablePath := filepath.Join(outputDir, "bin", "wrapper")
-	cmd := exec.Command("gcc", "-static", "-o", wrapperExecutablePath, wrapperFilePath)
+	cmd := exec.Command("gcc", "-static", "-o", wrapperExecutablePath, "-L", "/usr/lib/x86_64-linux-gnu/", "-L", "/usr/lib/aarch64-linux-gnu/", wrapperFilePath)
 	err = cmd.Run()
 	if err != nil {
 		// Try building with clang if gcc fails
-		cmd = exec.Command("clang", "-static", "-o", wrapperExecutablePath, wrapperFilePath)
+		cmd = exec.Command("clang", "-static", "-o", wrapperExecutablePath, "-L", "/usr/lib/x86_64-linux-gnu/", "-L", "/usr/lib/aarch64-linux-gnu/", wrapperFilePath)
 		err = cmd.Run()
 		if err != nil {
 			return fmt.Errorf("error building wrapper executable with both gcc and clang: %v", err)
