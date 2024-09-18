@@ -23,7 +23,6 @@ var (
 	outputDir        string
 	finalInstallPath string
 	forceFlag        bool
-	configFilePath   string
 	externalTools    = map[string][]string{
 		"darwin": {"otool", "install_name_tool"},
 		"linux":  {"ldd", "patchelf", "file"},
@@ -44,7 +43,6 @@ func init() {
 	flag.BoolVar(&forceFlag, "f", false, "Force the tool to proceed even if the output directory exists")
 	flag.StringVar(&outputDir, "output", "output", "Specify the output directory")
 	flag.StringVar(&finalInstallPath, "install-path", "", "Specify the final installation path for the package")
-	flag.StringVar(&configFilePath, "config", "", "Specify the configuration file path")
 	flag.Usage = usage
 }
 
@@ -57,7 +55,7 @@ It copies the binaries, their shared libraries, and sets up the correct RPATH.
 
 Usage:
 
-  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>] [-config <config-file>] [-f]
+  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>] [-f]
 
 Flags:
 
@@ -68,7 +66,7 @@ Flags:
 Examples:
 
   %s -p zeek -p suricata
-  %s -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor -install-path /opt/sensor -config config.txt
+  %s -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor -install-path /opt/sensor
 
 The program will create a 'sensor' directory (or the specified output directory) with the following structure:
 
@@ -94,8 +92,8 @@ func main() {
 		return
 	}
 
-	if len(binaries) == 0 && configFilePath == "" {
-		fmt.Println("Error: No binaries or configuration file specified. Use -p flag to specify binaries or -config flag to specify a configuration file.")
+	if len(binaries) == 0 {
+		fmt.Println("Error: No binaries specified. Use -p flag to specify binaries.")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -163,15 +161,6 @@ func main() {
 				fmt.Println("Failure due to missing libraries!")
 				os.Exit(1)
 			}
-		}
-	}
-
-	// Copy additional files specified in the configuration file
-	if configFilePath != "" {
-		err := copyAdditionalFiles(configFilePath)
-		if err != nil {
-			fmt.Printf("Error copying additional files: %v\n", err)
-			return
 		}
 	}
 
@@ -782,55 +771,6 @@ func renameAndCreateSymlink(executablePath string) error {
 
 	if verboseFlag {
 		fmt.Printf("Renamed executable to: %s and created symlink to wrapper: %s\n", dotPrefixedName, executablePath)
-	}
-
-	return nil
-}
-
-func copyAdditionalFiles(configFilePath string) error {
-	file, err := os.Open(configFilePath)
-	if err != nil {
-		return fmt.Errorf("error opening configuration file: %v", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		matches, err := filepath.Glob(line)
-		if err != nil {
-			return fmt.Errorf("error processing glob pattern %s: %v", line, err)
-		}
-
-		for _, match := range matches {
-			relPath, err := filepath.Rel(filepath.Dir(line), match)
-			if err != nil {
-				return fmt.Errorf("error getting relative path for %s: %v", match, err)
-			}
-
-			destPath := filepath.Join(outputDir, relPath)
-			err = os.MkdirAll(filepath.Dir(destPath), 0755)
-			if err != nil {
-				return fmt.Errorf("error creating destination directory for %s: %v", destPath, err)
-			}
-
-			err = copyFileWithIO(match, destPath)
-			if err != nil {
-				return fmt.Errorf("error copying file %s to %s: %v", match, destPath, err)
-			}
-
-			if verboseFlag {
-				fmt.Printf("Copied additional file: %s to %s\n", match, destPath)
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading configuration file: %v", err)
 	}
 
 	return nil
