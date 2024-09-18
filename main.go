@@ -131,6 +131,10 @@ func main() {
 		err := copyBinaryAndLibs(binary)
 		if err != nil {
 			fmt.Printf("Error processing binary %s: %v\n", binary, err)
+			if strings.Contains(err.Error(), "missing libraries") {
+				fmt.Println("Failure due to missing libraries!")
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -184,7 +188,7 @@ func main() {
 
 func checkExternalTools() error {
 	tools, ok := externalTools[runtime.GOOS]
-	if !ok {
+	if (!ok) {
 		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
 
@@ -292,7 +296,7 @@ func isSystemLibrary(path string) bool {
 		"/usr/lib",
 		"/System/Library",
 	}
-	for _, sysPath := systemPaths {
+	for _, sysPath := range systemPaths {
 		if strings.HasPrefix(path, sysPath) {
 			return true
 		}
