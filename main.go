@@ -243,6 +243,12 @@ func copyBinaryAndLibs(binary string) error {
 		return fmt.Errorf("error getting absolute path for %s: %v", binary, err)
 	}
 
+	// Create the output directory if it does not exist
+	err = os.MkdirAll(filepath.Join(outputDir, "bin"), 0755)
+	if err != nil {
+		return fmt.Errorf("error creating output directory: %v", err)
+	}
+
 	// Copy the binary to final location
 	destPath := filepath.Join(outputDir, "bin", filepath.Base(binaryPath))
 	err = copyFileWithIO(binaryPath, destPath)
@@ -622,6 +628,9 @@ func processLibrariesRecursively(libPath string) error {
 func setPermissionsRecursively(dir string) error {
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil // Skip non-existent files or directories
+			}
 			return err
 		}
 		if info.IsDir() {
