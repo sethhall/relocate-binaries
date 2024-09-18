@@ -20,6 +20,7 @@ var (
 	archiveFlag      bool
 	outputDir        string
 	finalInstallPath string
+	forceFlag        bool
 	externalTools    = map[string][]string{
 		"darwin": {"otool", "install_name_tool"},
 		"linux":  {"ldd", "patchelf", "file"},
@@ -34,6 +35,7 @@ func init() {
 	flag.BoolVar(&helpFlag, "help", false, "Display help information")
 	flag.BoolVar(&verboseFlag, "v", false, "Enable verbose output")
 	flag.BoolVar(&archiveFlag, "archive", false, "Create a compressed archive of the final bundle")
+	flag.BoolVar(&forceFlag, "f", false, "Force the tool to proceed even if the output directory exists")
 	flag.StringVar(&outputDir, "output", "output", "Specify the output directory")
 	flag.StringVar(&finalInstallPath, "install-path", "", "Specify the final installation path for the package")
 	flag.Usage = usage
@@ -48,7 +50,7 @@ It copies the binaries, their shared libraries, and sets up the correct RPATH.
 
 Usage:
 
-  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>]
+  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>] [-f]
 
 Flags:
 
@@ -112,6 +114,16 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error getting absolute path for sensor directory: %v\n", err)
 		return
+	}
+
+	// Check if output directory exists
+	if _, err := os.Stat(outputDir); !os.IsNotExist(err) {
+		if !forceFlag {
+			fmt.Printf("Error: Output directory %s already exists. Use -f flag to force the tool to proceed.\n", outputDir)
+			os.Exit(1)
+		} else if verboseFlag {
+			fmt.Printf("Output directory %s already exists, but proceeding due to -f flag.\n", outputDir)
+		}
 	}
 
 	// Create directories

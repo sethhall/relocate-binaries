@@ -40,12 +40,14 @@ Run the tool with the following command:
 ```sh
 Usage:
 
-  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>]
+  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-f]
 
 Flags:
 
   -archive
         Create a compressed archive of the final bundle
+  -f
+        Force the tool to proceed even if the output directory exists
   -help
         Display help information
   -output string
