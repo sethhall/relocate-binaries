@@ -142,6 +142,16 @@ func main() {
 		return
 	}
 
+		// Build and install the wrapper tool on Linux
+	if runtime.GOOS == "linux" {
+		err := buildAndInstallWrapper()
+		if err != nil {
+			fmt.Printf("Error building and installing wrapper: %v\n", err)
+			return
+		}
+	}
+
+
 	// Copy specified binaries and their shared libraries
 	for _, binary := range binaries {
 		err := copyBinaryAndLibs(binary)
@@ -196,15 +206,6 @@ func main() {
 			fmt.Printf("Error creating archive: %v\n", err)
 		} else {
 			fmt.Println("Archive created successfully.")
-		}
-	}
-
-	// Build and install the wrapper tool on Linux
-	if runtime.GOOS == "linux" {
-		err := buildAndInstallWrapper()
-		if err != nil {
-			fmt.Printf("Error building and installing wrapper: %v\n", err)
-			return
 		}
 	}
 
@@ -733,24 +734,22 @@ func buildAndInstallWrapper() error {
 func renameAndCreateSymlink(executablePath string) error {
 	dir := filepath.Dir(executablePath)
 	baseName := filepath.Base(executablePath)
-	dotPrefixedName := "." + baseName
-	dotPrefixedPath := filepath.Join(dir, dotPrefixedName)
+	dotPrefixedName := filepath.Join(dir, "." + baseName)
 
 	// Rename the original executable with a dot prefix
-	err := os.Rename(executablePath, dotPrefixedPath)
+	err := os.Rename(executablePath, dotPrefixedName)
 	if err != nil {
 		return fmt.Errorf("error renaming executable: %v", err)
 	}
 
 	// Create a symlink to the wrapper tool
-	wrapperPath := filepath.Join(dir, "wrapper")
-	err = os.Symlink(wrapperPath, executablePath)
+	err = os.Symlink("./wrapper", executablePath)
 	if err != nil {
 		return fmt.Errorf("error creating symlink to wrapper: %v", err)
 	}
 
 	if verboseFlag {
-		fmt.Printf("Renamed executable to: %s and created symlink to wrapper: %s\n", dotPrefixedPath, executablePath)
+		fmt.Printf("Renamed executable to: %s and created symlink to wrapper: %s\n", dotPrefixedName, executablePath)
 	}
 
 	return nil

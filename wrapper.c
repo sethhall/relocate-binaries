@@ -33,7 +33,6 @@ char* find_ld_linux(const char* lib_dir) {
 }
 
 int main(int argc, char *argv[]) {
-    char real_path[PATH_MAX];
     char *dir, *parent_dir, *base_name;
     char lib_dir[PATH_MAX];
     char ld_path[PATH_MAX];
@@ -43,13 +42,8 @@ int main(int argc, char *argv[]) {
     int i;
     size_t ret;
 
-    if (realpath(argv[0], real_path) == NULL) {
-        perror("realpath");
-        return 1;
-    }
-
-    dir = dirname(strdup(real_path));
-    base_name = basename(strdup(real_path));
+    dir = dirname(strdup(argv[0]));
+    base_name = basename(strdup(argv[0]));
     parent_dir = dirname(strdup(dir));
 
     ret = (size_t)snprintf(lib_dir, sizeof(lib_dir), "%s/lib", parent_dir);
