@@ -40,7 +40,7 @@ Run the tool with the following command:
 ```sh
 Usage:
 
-  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-config <config-file>] [-f]
+  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-f]
 
 Flags:
 
@@ -55,13 +55,11 @@ Flags:
   -p value
         Specify a binary to package (can be used multiple times)
   -v    Enable verbose output
-  -config string
-        Specify the configuration file path```
+```
 
 Examples:
 ./relocate-binaries -p /usr/bin/python3
 ./relocate-binaries -p /usr/bin/nginx -p /usr/sbin/php-fpm -v
-./relocate-binaries -config config.txt
 
 ## Output
 
@@ -78,16 +76,6 @@ output/
 │ └── (other required shared libraries)
 └── (other necessary files or directories)
 ```
-
-## Configuration File Format
-
-The configuration file should contain one file or glob pattern per line. Each line defines a file or set of files to copy into the output directory. For example:
-
-```
-/nix/store/fcxn3had3f3vfmaj2lfag282gkdn2pkb-zeek-6.2.0/share/zeek/base/*
-```
-
-This will copy all files and directories under that path into the output directory, preserving the directory structure.
 
 ## How It Works
 
