@@ -40,7 +40,7 @@ Run the tool with the following command:
 ```sh
 Usage:
 
-  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-f]
+  ./relocate-binaries -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>] [-f]
 
 Flags:
 
@@ -50,6 +50,8 @@ Flags:
         Force the tool to proceed even if the output directory exists
   -help
         Display help information
+  -install-path string
+        Specify the final installation path for the package
   -output string
         Specify the output directory (default "output")
   -p value

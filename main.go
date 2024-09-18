@@ -395,11 +395,15 @@ func copyFileWithIO(src, dst string) error {
 		if err != nil {
 			return fmt.Errorf("error reading symlink: %v", err)
 		}
-		// If the link is relative, make it absolute
-		if !filepath.IsAbs(linkTarget) {
-			linkTarget = filepath.Join(filepath.Dir(src), linkTarget)
+		// Create the symlink at the destination
+		err = os.Symlink(linkTarget, dst)
+		if err != nil {
+			return fmt.Errorf("error creating symlink: %v", err)
 		}
-		return copyFileWithIO(linkTarget, dst)
+		if verboseFlag {
+			fmt.Printf("Successfully created symlink: %s -> %s\n", dst, linkTarget)
+		}
+		return nil
 	}
 
 	destFile, err := os.Create(dst)
@@ -691,11 +695,19 @@ func createArchive() error {
 		}
 		header.Name = relPath
 
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("error reading symlink: %v", err)
+			}
+			header.Linkname = linkTarget
+		}
+
 		if err := tw.WriteHeader(header); err != nil {
 			return err
 		}
 
-		if !info.IsDir() {
+		if !info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
 			file, err := os.Open(path)
 			if err != nil {
 				return err
