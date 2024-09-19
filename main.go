@@ -200,12 +200,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create symlinks
-	err = createSymlinks()
-	if err != nil {
-		fmt.Printf("Error creating symlinks and copying wrapper: %v\n", err)
-		// Decide whether to exit here or continue with the rest of the process
-		os.Exit(1)
+	// Create symlinks for the executables on linux
+	if runtime.GOOS == "linux" {
+		err = createSymlinks()
+		if err != nil {
+			fmt.Printf("Error creating symlinks and copying wrapper: %v\n", err)
+			// Decide whether to exit here or continue with the rest of the process
+			os.Exit(1)
+		}
 	}
 
 	// Update RPATH and relocate libraries
@@ -216,7 +218,7 @@ func main() {
 			}
 			if !info.IsDir() {
 				if runtime.GOOS == "darwin" {
-					err = processLibrariesRecursively(path)
+					err = processLibrariesMacOS(path)
 					if err != nil {
 						fmt.Printf("Warning: %v\n", err)
 					}
@@ -292,14 +294,16 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 		return nil, fmt.Errorf("error getting absolute path for %s: %v", binary, err)
 	}
 
-	destPath := filepath.Join(outputDir, "bin", "."+filepath.Base(binaryPath))
+	destPath := filepath.Join(outputDir, "bin", filepath.Base(binaryPath))
+	if runtime.GOOS == "linux" {
+		destPath = filepath.Join(outputDir, "bin", "."+filepath.Base(binaryPath))
+	}
 
 	fileInfo, err := os.Lstat(binaryPath)
 	if err != nil {
 		return nil, fmt.Errorf("error getting file info for %s: %v", binary, err)
 	}
 
-	// Copy the binary with a dot prefix
 	fileOperations = append(fileOperations, FileOperation{
 		Source:      binaryPath,
 		Destination: destPath,
@@ -332,6 +336,9 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 }
 
 func createSymlinks() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
 	binDir := filepath.Join(outputDir, "bin")
 	files, err := os.ReadDir(binDir)
 	if err != nil {
@@ -355,20 +362,66 @@ func createSymlinks() error {
 }
 
 func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
-	fileOperations := []FileOperation{}
-	seenDestinations := make(map[string]bool)
-
 	if verboseFlag {
 		fmt.Printf("Planning shared libraries for: %s\n", binaryPath)
 	}
 
-	output, err := exec.Command("ldd", binaryPath).Output()
+	var output []byte
+	var err error
+
+	if runtime.GOOS == "darwin" {
+		output, err = exec.Command("otool", "-L", binaryPath).Output()
+	} else {
+		output, err = exec.Command("ldd", binaryPath).Output()
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("error listing shared libraries: %v", err)
 	}
 
 	lines := strings.Split(string(output), "\n")
-	missingLibraries := []string{}
+
+	if runtime.GOOS == "darwin" {
+		return planSharedLibrariesMacOS(lines, binaryPath)
+	} else {
+		return planSharedLibrariesLinux(lines, binaryPath)
+	}
+}
+
+func planSharedLibrariesMacOS(lines []string, binaryPath string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
+	seenDestinations := make(map[string]bool)
+
+	for i, line := range lines {
+		if i == 0 || len(strings.TrimSpace(line)) == 0 {
+			continue // Skip the first line (binary path) and empty lines
+		}
+		parts := strings.Fields(strings.TrimSpace(line))
+		if len(parts) >= 1 {
+			libPath := parts[0]
+			if !isSystemLibrary(libPath) {
+				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
+				fileOps, err := createFileOperation(libPath, destPath)
+				if err != nil {
+					return nil, err
+				}
+				for _, op := range fileOps {
+					if !seenDestinations[op.Destination] {
+						fileOperations = append(fileOperations, op)
+						seenDestinations[op.Destination] = true
+					}
+				}
+			}
+		}
+	}
+
+	return fileOperations, nil
+}
+
+func planSharedLibrariesLinux(lines []string, binaryPath string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
+	seenDestinations := make(map[string]bool)
+	var missingLibraries []string
 
 	for _, line := range lines {
 		if strings.Contains(line, "=>") {
@@ -379,12 +432,10 @@ func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
 				} else {
 					libPath := parts[2]
 					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-
 					fileOps, err := createFileOperation(libPath, destPath)
 					if err != nil {
 						return nil, err
 					}
-
 					for _, op := range fileOps {
 						if !seenDestinations[op.Destination] {
 							fileOperations = append(fileOperations, op)
@@ -396,12 +447,10 @@ func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
 		} else if strings.Contains(line, "ld-linux-") {
 			libPath := strings.Fields(line)[0]
 			destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-
 			fileOps, err := createFileOperation(libPath, destPath)
 			if err != nil {
 				return nil, err
 			}
-
 			for _, op := range fileOps {
 				if !seenDestinations[op.Destination] {
 					fileOperations = append(fileOperations, op)
@@ -460,6 +509,9 @@ func isSystemLibrary(path string) bool {
 	systemPaths := []string{
 		"/usr/lib",
 		"/System/Library",
+		"/Library/Apple",
+		"/System/iOSSupport",
+		"/Library/Developer",
 	}
 	for _, sysPath := range systemPaths {
 		if strings.HasPrefix(path, sysPath) {
@@ -471,10 +523,8 @@ func isSystemLibrary(path string) bool {
 
 func executeFileOperations(fileOperations []FileOperation) error {
 	var errors []string
-
 	for _, op := range fileOperations {
 		var err error
-
 		if op.IsSymlink {
 			err = createSymlink(op)
 		} else if op.IsDirectory {
@@ -482,17 +532,33 @@ func executeFileOperations(fileOperations []FileOperation) error {
 		} else {
 			err = copyFileWithIO(op.Source, op.Destination)
 		}
-
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("Error processing %s: %v", op.Source, err))
 			fmt.Printf("Warning: %s\n", errors[len(errors)-1])
 		}
 	}
 
+	// Only rename and create symlinks for the wrapper on Linux
+	if runtime.GOOS == "linux" {
+		binDir := filepath.Join(outputDir, "bin")
+		files, err := os.ReadDir(binDir)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Error reading bin directory: %v", err))
+		} else {
+			for _, file := range files {
+				if !file.IsDir() && !strings.HasPrefix(file.Name(), ".") {
+					err := renameAndCreateSymlink(filepath.Join(binDir, file.Name()))
+					if err != nil {
+						errors = append(errors, fmt.Sprintf("Error renaming and creating symlink: %v", err))
+					}
+				}
+			}
+		}
+	}
+
 	if len(errors) > 0 {
 		return fmt.Errorf("encountered %d errors during file operations:\n%s", len(errors), strings.Join(errors, "\n"))
 	}
-
 	return nil
 }
 
@@ -771,36 +837,35 @@ func updateInterpreterPath(path string) error {
 }
 
 func addRPATHMacOS(path string) error {
-	cmd := exec.Command("otool", "-l", path)
+	// Check if the file is a Mach-O binary or dynamic library
+	cmd := exec.Command("file", path)
 	output, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("error checking RPATH for %s: %v", path, err)
+		return fmt.Errorf("error checking file type for %s: %v", path, err)
+	}
+	if !strings.Contains(string(output), "Mach-O") {
+		if verboseFlag {
+			fmt.Printf("Skipping non-Mach-O file: %s\n", path)
+		}
+		return nil
 	}
 
-	if !strings.Contains(string(output), "@executable_path/../lib") {
-		cmd = exec.Command("install_name_tool", "-add_rpath", "@executable_path/../lib", path)
-		err = cmd.Run()
-		if err != nil {
-			return fmt.Errorf("failed to add RPATH for %s: %v", path, err)
-		}
-		if verboseFlag {
-			fmt.Printf("Added RPATH to: %s\n", path)
-		}
-	} else if verboseFlag {
-		fmt.Printf("RPATH already exists for: %s\n", path)
+	// Add @executable_path/../lib RPATH
+	cmd = exec.Command("install_name_tool", "-add_rpath", "@executable_path/../lib", path)
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to add @executable_path/../lib RPATH for %s: %v", path, err)
 	}
 
-	// Also add the absolute path to the lib directory
-	absLibPath := filepath.Join(outputDir, "lib")
-	if !strings.Contains(string(output), absLibPath) {
-		cmd = exec.Command("install_name_tool", "-add_rpath", absLibPath, path)
-		err = cmd.Run()
-		if err != nil {
-			return fmt.Errorf("failed to add absolute RPATH for %s: %v", path, err)
-		}
-		if verboseFlag {
-			fmt.Printf("Added absolute RPATH to: %s\n", path)
-		}
+	// Add @loader_path/../lib RPATH
+	cmd = exec.Command("install_name_tool", "-add_rpath", "@loader_path/../lib", path)
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to add @loader_path/../lib RPATH for %s: %v", path, err)
+	}
+
+	if verboseFlag {
+		fmt.Printf("Added RPATHs to: %s\n", path)
 	}
 
 	return nil
@@ -830,6 +895,7 @@ func updateMacOSLibPaths(binaryPath string) error {
 					} else if verboseFlag {
 						fmt.Printf("Updated library path: %s to %s in %s\n", libPath, newPath, binaryPath)
 					}
+
 					// Copy the library if it's not already in the lib directory
 					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
 					if _, err := os.Stat(destPath); os.IsNotExist(err) {
@@ -844,10 +910,11 @@ func updateMacOSLibPaths(binaryPath string) error {
 			}
 		}
 	}
+
 	return nil
 }
 
-func processLibrariesRecursively(libPath string) error {
+func processLibrariesMacOS(libPath string) error {
 	if verboseFlag {
 		fmt.Printf("Processing library: %s\n", libPath)
 	}
@@ -883,7 +950,7 @@ func processLibrariesRecursively(libPath string) error {
 						if err != nil {
 							fmt.Printf("Warning: Failed to copy %s: %v\n", depLibPath, err)
 						} else {
-							err = processLibrariesRecursively(destPath)
+							err = processLibrariesMacOS(destPath)
 							if err != nil {
 								fmt.Printf("Warning: Failed to process %s: %v\n", destPath, err)
 							}
@@ -893,6 +960,7 @@ func processLibrariesRecursively(libPath string) error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -990,6 +1058,9 @@ func createArchive() error {
 }
 
 func buildAndInstallWrapper() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("wrapper is only supported on Linux")
+	}
 	// Create a temporary directory for the wrapper source code
 	tempDir, err := os.MkdirTemp("", "wrapper")
 	if err != nil {
