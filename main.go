@@ -339,6 +339,7 @@ func createSymlinks() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
+
 	binDir := filepath.Join(outputDir, "bin")
 	files, err := os.ReadDir(binDir)
 	if err != nil {
@@ -1103,6 +1104,12 @@ func buildAndInstallWrapper() error {
 func renameAndCreateSymlink(executablePath string) error {
 	dir := filepath.Dir(executablePath)
 	baseName := filepath.Base(executablePath)
+
+	// Don't rename the wrapper itself
+	if baseName == "wrapper" {
+		return nil
+	}
+
 	dotPrefixedName := filepath.Join(dir, "."+baseName)
 
 	// Rename the original executable with a dot prefix
