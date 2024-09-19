@@ -808,8 +808,7 @@ func copyNixPkgFiles(binaryPath string) error {
 	err := filepath.Walk(nixPkgDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if os.IsPermission(err) {
-				fmt.Printf("Warning: Skipping %s due to permission error: %v\n", path, err)
-				return nil
+				return fmt.Errorf("error copying nix package files: %v", err)
 			}
 			return err
 		}
@@ -822,22 +821,14 @@ func copyNixPkgFiles(binaryPath string) error {
 		destPath := filepath.Join(outputDir, relPath)
 
 		if info.IsDir() {
-			err = os.MkdirAll(destPath, info.Mode())
+			err = os.MkdirAll(destPath, 0755)
 			if err != nil {
-				if os.IsPermission(err) {
-					fmt.Printf("Warning: Skipping %s due to permission error: %v\n", destPath, err)
-					return nil
-				}
-				return err
+				return fmt.Errorf("error copying nix package files: %v", err)
 			}
 		} else {
 			err = copyFileWithIO(path, destPath)
 			if err != nil {
-				if os.IsPermission(err) {
-					fmt.Printf("Warning: Skipping %s due to permission error: %v\n", destPath, err)
-					return nil
-				}
-				return err
+				return fmt.Errorf("error copying nix package files: %v", err)
 			}
 		}
 
