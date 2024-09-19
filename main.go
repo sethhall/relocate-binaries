@@ -405,6 +405,19 @@ func copyFileWithIO(src, dst string) error {
 		linkTarget, err := os.Readlink(src)
 		if err != nil {
 			return fmt.Errorf("error reading symlink: %v", err)
+			}
+		// Check if the target of the symlink is within the final output directory
+		absLinkTarget, err := filepath.Abs(linkTarget)
+		if err != nil {
+			return fmt.Errorf("error getting absolute path of symlink target: %v", err)
+		}
+		if strings.HasPrefix(absLinkTarget, outputDir) {
+			// Create a relative symlink if the target is in the final output directory
+			relLinkTarget, err := filepath.Rel(filepath.Dir(dst), absLinkTarget)
+			if err != nil {
+				return fmt.Errorf("error getting relative path of symlink target: %v", err)
+			}
+			linkTarget = relLinkTarget
 		}
 		// Create the symlink at the destination
 		err = os.Symlink(linkTarget, dst)
