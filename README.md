@@ -62,6 +62,7 @@ Flags:
 Examples:
 ./relocate-binaries -p /usr/bin/python3
 ./relocate-binaries -p /usr/bin/nginx -p /usr/sbin/php-fpm -v
+./relocate-binaries -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor -install-path /opt/sensor
 
 ## Output
 
