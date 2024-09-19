@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"embed"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -33,10 +34,12 @@ var (
 var wrapperSource embed.FS
 
 type FileOperation struct {
-	Source      string
-	Destination string
-	IsSymlink   bool
-	LinkTarget  string
+	Source      string      `json:"source"`
+	Destination string      `json:"destination"`
+	IsSymlink   bool        `json:"is_symlink"`
+	LinkTarget  string      `json:"link_target,omitempty"`
+	IsDirectory bool        `json:"is_directory"`
+	Permissions os.FileMode `json:"permissions"`
 }
 
 func init() {
@@ -183,18 +186,18 @@ func main() {
 		return
 	}
 
-	// Execution stage: Perform the file operations
-	err = executeFileOperations(fileOperations)
-	if err != nil {
-		fmt.Printf("Error executing file operations: %v\n", err)
+	// Write the manifest
+	if err := writeManifest(fileOperations); err != nil {
+		fmt.Printf("Error writing manifest: %v\n", err)
 		return
 	}
 
-	// Set permissions recursively
-	err = setPermissionsRecursively(outputDir)
+	// Execute file operations
+	err = executeFileOperations(fileOperations)
 	if err != nil {
-		fmt.Printf("Error setting permissions: %v\n", err)
-		return
+		fmt.Printf("Errors occurred during file operations: %v\n", err)
+		// Decide whether to exit here or continue with the rest of the process
+		// os.Exit(1)
 	}
 
 	// Update RPATH and relocate libraries
@@ -223,10 +226,18 @@ func main() {
 				}
 			}
 			return nil
-			})
+		})
 		if err != nil {
 			fmt.Printf("Error updating RPATH and relocating libraries: %v\n", err)
 		}
+	}
+
+	// Apply final permissions
+	err = applyFinalPermissions(fileOperations)
+	if err != nil {
+		fmt.Printf("Errors occurred while applying final permissions: %v\n", err)
+		// Decide whether to exit here or continue with the rest of the process
+		os.Exit(1)
 	}
 
 	if archiveFlag {
@@ -263,24 +274,41 @@ func checkExternalTools() error {
 func planFileOperations(binary string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 
-	// Find the binary
 	binaryPath, err := exec.LookPath(binary)
 	if err != nil {
 		return nil, fmt.Errorf("error finding %s: %v", binary, err)
 	}
 
-	// Get absolute path
 	binaryPath, err = filepath.Abs(binaryPath)
 	if err != nil {
 		return nil, fmt.Errorf("error getting absolute path for %s: %v", binary, err)
 	}
 
-	// Plan the binary copy operation
 	destPath := filepath.Join(outputDir, "bin", filepath.Base(binaryPath))
+	dotPrefixedDestPath := filepath.Join(filepath.Dir(destPath), "."+filepath.Base(destPath))
+
+	fileInfo, err := os.Lstat(binaryPath)
+	if err != nil {
+		return nil, fmt.Errorf("error getting file info for %s: %v", binary, err)
+	}
+
+	// Copy the binary with a dot prefix
 	fileOperations = append(fileOperations, FileOperation{
 		Source:      binaryPath,
-		Destination: destPath,
+		Destination: dotPrefixedDestPath,
 		IsSymlink:   false,
+		IsDirectory: false,
+		Permissions: fileInfo.Mode().Perm(),
+	})
+
+	// Add a symlink operation for the wrapper
+	fileOperations = append(fileOperations, FileOperation{
+		Source:      "./wrapper",
+		Destination: destPath,
+		IsSymlink:   true,
+		LinkTarget:  "./wrapper",
+		IsDirectory: false,
+		Permissions: 0755,
 	})
 
 	// Plan shared libraries copy operations
@@ -288,6 +316,7 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error planning shared libraries for %s: %v", binary, err)
 	}
+
 	fileOperations = append(fileOperations, ops...)
 
 	// Handle nix packages
@@ -306,7 +335,8 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 }
 
 func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
-	var fileOperations []FileOperation
+	fileOperations := []FileOperation{}
+	seenDestinations := make(map[string]bool)
 
 	if verboseFlag {
 		fmt.Printf("Planning shared libraries for: %s\n", binaryPath)
@@ -319,6 +349,7 @@ func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
 
 	lines := strings.Split(string(output), "\n")
 	missingLibraries := []string{}
+
 	for _, line := range lines {
 		if strings.Contains(line, "=>") {
 			parts := strings.Fields(line)
@@ -328,22 +359,35 @@ func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
 				} else {
 					libPath := parts[2]
 					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-					fileOperations = append(fileOperations, FileOperation{
-						Source:      libPath,
-						Destination: destPath,
-						IsSymlink:   false,
-					})
+
+					fileOps, err := createFileOperation(libPath, destPath)
+					if err != nil {
+						return nil, err
+					}
+
+					for _, op := range fileOps {
+						if !seenDestinations[op.Destination] {
+							fileOperations = append(fileOperations, op)
+							seenDestinations[op.Destination] = true
+						}
+					}
 				}
 			}
-			// Handle ldd output without "=>" when ld-linux- is displayed weird.
 		} else if strings.Contains(line, "ld-linux-") {
 			libPath := strings.Fields(line)[0]
 			destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-			fileOperations = append(fileOperations, FileOperation{
-				Source:      libPath,
-				Destination: destPath,
-				IsSymlink:   false,
-			})
+
+			fileOps, err := createFileOperation(libPath, destPath)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, op := range fileOps {
+				if !seenDestinations[op.Destination] {
+					fileOperations = append(fileOperations, op)
+					seenDestinations[op.Destination] = true
+				}
+			}
 		}
 	}
 
@@ -352,6 +396,44 @@ func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
 	}
 
 	return fileOperations, nil
+}
+
+func createFileOperation(sourcePath, destPath string) ([]FileOperation, error) {
+	fileInfo, err := os.Lstat(sourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("error getting file info for %s: %v", sourcePath, err)
+	}
+
+	fileOp := FileOperation{
+		Source:      sourcePath,
+		Destination: destPath,
+		IsSymlink:   fileInfo.Mode()&os.ModeSymlink != 0,
+		IsDirectory: fileInfo.IsDir(),
+		Permissions: fileInfo.Mode().Perm(),
+	}
+
+	if fileOp.IsSymlink {
+		linkTarget, err := os.Readlink(sourcePath)
+		if err != nil {
+			return nil, fmt.Errorf("error reading symlink %s: %v", sourcePath, err)
+		}
+		fileOp.LinkTarget = linkTarget
+
+		// If the symlink is relative, make it absolute
+		if !filepath.IsAbs(linkTarget) {
+			fileOp.LinkTarget = filepath.Join(filepath.Dir(sourcePath), linkTarget)
+		}
+
+		// Add the target file as well
+		targetFileOps, err := createFileOperation(fileOp.LinkTarget, filepath.Join(filepath.Dir(destPath), filepath.Base(fileOp.LinkTarget)))
+		if err != nil {
+			return nil, err
+		}
+
+		return append([]FileOperation{fileOp}, targetFileOps...), nil
+	}
+
+	return []FileOperation{fileOp}, nil
 }
 
 func isSystemLibrary(path string) bool {
@@ -368,39 +450,165 @@ func isSystemLibrary(path string) bool {
 }
 
 func executeFileOperations(fileOperations []FileOperation) error {
-	for _, op := range fileOperations {
-		if op.IsSymlink {
-			err := os.Symlink(op.LinkTarget, op.Destination)
-			if err != nil {
-				return fmt.Errorf("error creating symlink: %v", err)
-			}
-			if verboseFlag {
-				fmt.Printf("Successfully created symlink: %s -> %s\n", op.Destination, op.LinkTarget)
-			}
-		} else {
-			err := copyFileWithIO(op.Source, op.Destination)
-			if err != nil {
-				return fmt.Errorf("error copying file: %v", err)
-			}
-			if verboseFlag {
-				fmt.Printf("Successfully copied: %s to %s\n", op.Source, op.Destination)
-			}
-		}
+    var errors []string
+
+    for _, op := range fileOperations {
+        var err error
+
+        if op.IsSymlink {
+            err = createSymlink(op)
+        } else if op.IsDirectory {
+            err = os.MkdirAll(op.Destination, 0777)
+        } else {
+            err = copyFileWithIO(op.Source, op.Destination)
+        }
+
+        if err != nil {
+            errors = append(errors, fmt.Sprintf("Error processing %s: %v", op.Source, err))
+            fmt.Printf("Warning: %s\n", errors[len(errors)-1])
+        }
+    }
+
+    // Create symlinks for executables
+    files, err := os.ReadDir(filepath.Join(outputDir, "bin"))
+    if err != nil {
+        return fmt.Errorf("error reading bin directory: %v", err)
+    }
+
+    for _, file := range files {
+        if !file.IsDir() && strings.HasPrefix(file.Name(), ".") {
+            execName := strings.TrimPrefix(file.Name(), ".")
+            symlinkPath := filepath.Join(outputDir, "bin", execName)
+            err := os.Symlink("./wrapper", symlinkPath)
+            if err != nil {
+                errors = append(errors, fmt.Sprintf("Error creating symlink for %s: %v", execName, err))
+                fmt.Printf("Warning: %s\n", errors[len(errors)-1])
+            } else if verboseFlag {
+                fmt.Printf("Created symlink: %s -> ./wrapper\n", symlinkPath)
+            }
+        }
+    }
+
+    if len(errors) > 0 {
+        return fmt.Errorf("encountered %d errors during file operations:\n%s", len(errors), strings.Join(errors, "\n"))
+    }
+
+    return nil
+}
+
+func writeManifest(fileOperations []FileOperation) error {
+	manifestPath := filepath.Join(outputDir, "manifest.json")
+	file, err := os.Create(manifestPath)
+	if err != nil {
+		return fmt.Errorf("failed to create manifest file: %v", err)
 	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ") // Pretty print the JSON
+	if err := encoder.Encode(fileOperations); err != nil {
+		return fmt.Errorf("failed to encode manifest: %v", err)
+	}
+
+	if verboseFlag {
+		fmt.Printf("Manifest file created: %s\n", manifestPath)
+	}
+
 	return nil
 }
 
-func copyFileWithIO(src, dst string) error {
-	if verboseFlag {
-		fmt.Printf("Attempting to copy: %s to %s\n", src, dst)
+func createSymlink(op FileOperation) error {
+	if err := os.MkdirAll(filepath.Dir(op.Destination), 0755); err != nil {
+		return fmt.Errorf("error creating parent directory for symlink: %v", err)
 	}
 
-	// Check if destination file already exists
+	// Read the original symlink
+	originalTarget, err := os.Readlink(op.Source)
+	if err != nil {
+		return fmt.Errorf("error reading original symlink %s: %v", op.Source, err)
+	}
+
+	// Determine if the symlink is absolute or relative
+	var linkTarget string
+	if filepath.IsAbs(originalTarget) {
+		// If it's an absolute path, we need to adjust it to the new location
+		relPath, err := filepath.Rel(filepath.Dir(op.Source), originalTarget)
+		if err != nil {
+			return fmt.Errorf("error calculating relative path: %v", err)
+		}
+		linkTarget = filepath.Join(filepath.Dir(op.Destination), relPath)
+	} else {
+		// If it's a relative path, we can use it as is
+		linkTarget = originalTarget
+	}
+
+	// Remove the destination if it already exists
+	if err := os.RemoveAll(op.Destination); err != nil {
+		return fmt.Errorf("error removing existing destination: %v", err)
+	}
+
+	// Create the new symlink
+	if err := os.Symlink(linkTarget, op.Destination); err != nil {
+		return fmt.Errorf("error creating symlink: %v", err)
+	}
+
+	if verboseFlag {
+		fmt.Printf("Successfully created symlink: %s -> %s\n", op.Destination, linkTarget)
+	}
+
+	return nil
+}
+
+func copyFileOrDir(op FileOperation) error {
+	sourceInfo, err := os.Stat(op.Source)
+	if err != nil {
+		return fmt.Errorf("error getting source info: %v", err)
+	}
+
+	if sourceInfo.IsDir() {
+		return copyDir(op.Source, op.Destination)
+	}
+	return copyFile(op.Source, op.Destination)
+}
+
+func copyDir(src, dst string) error {
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return fmt.Errorf("error creating directory: %v", err)
+	}
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("error reading directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				fmt.Printf("Warning: Failed to copy directory %s to %s: %v\n", srcPath, dstPath, err)
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				fmt.Printf("Warning: Failed to copy file %s to %s: %v\n", srcPath, dstPath, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func copyFile(src, dst string) error {
 	if _, err := os.Stat(dst); err == nil {
 		if verboseFlag {
 			fmt.Printf("File already exists, skipping: %s\n", dst)
 		}
 		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return fmt.Errorf("error creating parent directory: %v", err)
 	}
 
 	sourceFile, err := os.Open(src)
@@ -409,61 +617,22 @@ func copyFileWithIO(src, dst string) error {
 	}
 	defer sourceFile.Close()
 
-	// Get file info to check if it's a symlink
-	fileInfo, err := sourceFile.Stat()
-	if err != nil {
-		return fmt.Errorf("error getting file info: %v", err)
-	}
-
-	// If it's a symlink, read the link and copy the target
-	if fileInfo.Mode()&os.ModeSymlink != 0 {
-		linkTarget, err := os.Readlink(src)
-		if err != nil {
-			return fmt.Errorf("error reading symlink: %v", err)
-			}
-		// Check if the target of the symlink is within the final output directory
-		absLinkTarget, err := filepath.Abs(linkTarget)
-		if err != nil {
-			return fmt.Errorf("error getting absolute path of symlink target: %v", err)
-		}
-		if strings.HasPrefix(absLinkTarget, outputDir) {
-			// Create a relative symlink if the target is in the final output directory
-			relLinkTarget, err := filepath.Rel(filepath.Dir(dst), absLinkTarget)
-			if err != nil {
-				return fmt.Errorf("error getting relative path of symlink target: %v", err)
-			}
-			linkTarget = relLinkTarget
-		}
-		// Create the symlink at the destination
-		err = os.Symlink(linkTarget, dst)
-		if err != nil {
-			return fmt.Errorf("error creating symlink: %v", err)
-		}
-		if verboseFlag {
-			fmt.Printf("Successfully created symlink: %s -> %s\n", dst, linkTarget)
-		}
-		return nil
-	}
-
 	destFile, err := os.Create(dst)
 	if err != nil {
 		return fmt.Errorf("error creating destination file: %v", err)
 	}
 	defer destFile.Close()
 
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
+	if _, err = io.Copy(destFile, sourceFile); err != nil {
 		return fmt.Errorf("error copying file contents: %v", err)
 	}
 
-	// Copy mode from source to destination
-	srcInfo, err := os.Stat(src)
+	sourceInfo, err := os.Stat(src)
 	if err != nil {
 		return fmt.Errorf("error getting source file info: %v", err)
 	}
 
-	err = os.Chmod(dst, srcInfo.Mode())
-	if err != nil {
+	if err = os.Chmod(dst, sourceInfo.Mode()); err != nil {
 		return fmt.Errorf("error setting file permissions: %v", err)
 	}
 
@@ -471,6 +640,44 @@ func copyFileWithIO(src, dst string) error {
 		fmt.Printf("Successfully copied: %s to %s\n", src, dst)
 	}
 
+	return nil
+}
+
+func copyFileWithIO(src, dst string) error {
+	if verboseFlag {
+		fmt.Printf("Attempting to copy: %s to %s\n", src, dst)
+	}
+	// Ensure the destination directory exists
+	dstDir := filepath.Dir(dst)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return fmt.Errorf("error creating destination directory %s: %v", dstDir, err)
+	}
+	// Check if destination file already exists
+	if _, err := os.Stat(dst); err == nil {
+		if verboseFlag {
+			fmt.Printf("File already exists, removing: %s\n", dst)
+		}
+		if err := os.Remove(dst); err != nil {
+			return fmt.Errorf("error removing existing file %s: %v", dst, err)
+		}
+	}
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("error opening source file %s: %v", src, err)
+	}
+	defer sourceFile.Close()
+	destFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0777)
+	if err != nil {
+		return fmt.Errorf("error creating destination file %s: %v", dst, err)
+	}
+	defer destFile.Close()
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return fmt.Errorf("error copying file contents from %s to %s: %v", src, dst, err)
+	}
+	if verboseFlag {
+		fmt.Printf("Successfully copied: %s to %s\n", src, dst)
+	}
 	return nil
 }
 
@@ -693,15 +900,35 @@ func setPermissionsRecursively(dir string) error {
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil // Skip non-existent files or directories
+				fmt.Printf("Warning: Path does not exist, skipping: %s\n", path)
+				return nil
 			}
 			return err
 		}
+
 		if info.IsDir() {
 			return os.Chmod(path, 0755)
 		}
-		return os.Chmod(path, 0755)
+		return os.Chmod(path, 0744)
 	})
+}
+
+func applyFinalPermissions(fileOperations []FileOperation) error {
+	for _, op := range fileOperations {
+		if op.IsSymlink {
+			continue // Skip symlinks
+		}
+
+		err := os.Chmod(op.Destination, op.Permissions)
+		if err != nil {
+			return fmt.Errorf("error setting permissions for %s: %v", op.Destination, err)
+		}
+
+		if verboseFlag {
+			fmt.Printf("Applied final permissions %s to: %s\n", op.Permissions, op.Destination)
+		}
+	}
+	return nil
 }
 
 func createArchive() error {
@@ -777,7 +1004,7 @@ func buildAndInstallWrapper() error {
 	}
 
 	wrapperFilePath := filepath.Join(tempDir, "wrapper.c")
-	err = os.WriteFile(wrapperFilePath, wrapperSourceData, 0644)
+	err = os.WriteFile(wrapperFilePath, wrapperSourceData, 0744)
 	if err != nil {
 		return fmt.Errorf("error writing wrapper source code: %v", err)
 	}
@@ -805,7 +1032,7 @@ func buildAndInstallWrapper() error {
 func renameAndCreateSymlink(executablePath string) error {
 	dir := filepath.Dir(executablePath)
 	baseName := filepath.Base(executablePath)
-	dotPrefixedName := filepath.Join(dir, "." + baseName)
+	dotPrefixedName := filepath.Join(dir, "."+baseName)
 
 	// Rename the original executable with a dot prefix
 	err := os.Rename(executablePath, dotPrefixedName)
@@ -832,6 +1059,7 @@ func isNixPkg(path string) bool {
 
 func planNixPkgFiles(binaryPath string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
+
 	nixPkgDir := filepath.Dir(filepath.Dir(binaryPath))
 
 	err := filepath.Walk(nixPkgDir, func(path string, info os.FileInfo, err error) error {
@@ -842,6 +1070,11 @@ func planNixPkgFiles(binaryPath string) ([]FileOperation, error) {
 			return err
 		}
 
+		// Skip bin directories
+		if info.IsDir() && filepath.Base(path) == "bin" {
+			return filepath.SkipDir
+		}
+
 		relPath, err := filepath.Rel(nixPkgDir, path)
 		if err != nil {
 			return err
@@ -849,19 +1082,23 @@ func planNixPkgFiles(binaryPath string) ([]FileOperation, error) {
 
 		destPath := filepath.Join(outputDir, relPath)
 
-		if info.IsDir() {
-			fileOperations = append(fileOperations, FileOperation{
-				Source:      path,
-				Destination: destPath,
-				IsSymlink:   false,
-			})
-		} else {
-			fileOperations = append(fileOperations, FileOperation{
-				Source:      path,
-				Destination: destPath,
-				IsSymlink:   false,
-			})
+		fileOp := FileOperation{
+			Source:      path,
+			Destination: destPath,
+			IsSymlink:   info.Mode()&os.ModeSymlink != 0,
+			IsDirectory: info.IsDir(),
+			Permissions: info.Mode().Perm(),
 		}
+
+		if fileOp.IsSymlink {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("error reading symlink %s: %v", path, err)
+			}
+			fileOp.LinkTarget = linkTarget
+		}
+
+		fileOperations = append(fileOperations, fileOp)
 
 		return nil
 	})

@@ -4,4 +4,5 @@ relocate-binaries
 
 # Ignore any output directory
 output/
+*.tar.gz
 
