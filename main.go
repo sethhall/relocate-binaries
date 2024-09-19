@@ -263,17 +263,6 @@ func copyBinaryAndLibs(binary string) error {
 		fmt.Printf("Copied binary: %s to %s\n", binaryPath, destPath)
 	}
 
-	// Check if the binary is a nix package
-	if isNixPkg(binaryPath) {
-		if verboseFlag {
-			fmt.Printf("Detected nix package: %s - Copying other package files...\n", binaryPath)
-		}
-		err = copyNixPkgFiles(binaryPath)
-		if err != nil {
-			return fmt.Errorf("error copying nix package files for %s: %v", binary, err)
-		}
-	}
-
 	// Copy shared libraries
 	err = copySharedLibraries(binaryPath)
 	if err != nil {
@@ -291,6 +280,17 @@ func copyBinaryAndLibs(binary string) error {
 		err = renameAndCreateSymlink(destPath)
 		if err != nil {
 			return fmt.Errorf("error renaming and creating symlink for %s: %v", destPath, err)
+		}
+	}
+
+	// Handle nix packages
+	if isNixPkg(binaryPath) {
+		if verboseFlag {
+			fmt.Printf("Detected nix package: %s\n", binaryPath)
+		}
+		err = copyNixPkgFiles(binaryPath)
+		if err != nil {
+			return fmt.Errorf("error copying nix package files for %s: %v", binary, err)
 		}
 	}
 
@@ -798,28 +798,55 @@ func renameAndCreateSymlink(executablePath string) error {
 	return nil
 }
 
-func isNixPkg(binaryPath string) bool {
-	return strings.Contains(binaryPath, "/nix/store/")
+func isNixPkg(path string) bool {
+	return strings.Contains(path, "/nix/store/")
 }
 
 func copyNixPkgFiles(binaryPath string) error {
-	nixStorePath := filepath.Dir(filepath.Dir(binaryPath))
-	err := filepath.Walk(nixStorePath, func(path string, info os.FileInfo, err error) error {
+	nixPkgDir := filepath.Dir(filepath.Dir(binaryPath))
+
+	err := filepath.Walk(nixPkgDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				fmt.Printf("Warning: Skipping %s due to permission error: %v\n", path, err)
+				return nil
+			}
+			return err
+		}
+
+		relPath, err := filepath.Rel(nixPkgDir, path)
 		if err != nil {
 			return err
 		}
-		relPath, err := filepath.Rel(nixStorePath, path)
-		if err != nil {
-			return err
-		}
+
 		destPath := filepath.Join(outputDir, relPath)
+
 		if info.IsDir() {
-			return os.MkdirAll(destPath, info.Mode())
+			err = os.MkdirAll(destPath, info.Mode())
+			if err != nil {
+				if os.IsPermission(err) {
+					fmt.Printf("Warning: Skipping %s due to permission error: %v\n", destPath, err)
+					return nil
+				}
+				return err
+			}
+		} else {
+			err = copyFileWithIO(path, destPath)
+			if err != nil {
+				if os.IsPermission(err) {
+					fmt.Printf("Warning: Skipping %s due to permission error: %v\n", destPath, err)
+					return nil
+				}
+				return err
+			}
 		}
-		return copyFileWithIO(path, destPath)
+
+		return nil
 	})
+
 	if err != nil {
 		return fmt.Errorf("error copying nix package files: %v", err)
 	}
+
 	return nil
 }
