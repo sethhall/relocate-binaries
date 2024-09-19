@@ -197,7 +197,15 @@ func main() {
 	if err != nil {
 		fmt.Printf("Errors occurred during file operations: %v\n", err)
 		// Decide whether to exit here or continue with the rest of the process
-		// os.Exit(1)
+		os.Exit(1)
+	}
+
+	// Create symlinks
+	err = createSymlinks()
+	if err != nil {
+		fmt.Printf("Error creating symlinks and copying wrapper: %v\n", err)
+		// Decide whether to exit here or continue with the rest of the process
+		os.Exit(1)
 	}
 
 	// Update RPATH and relocate libraries
@@ -284,8 +292,7 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 		return nil, fmt.Errorf("error getting absolute path for %s: %v", binary, err)
 	}
 
-	destPath := filepath.Join(outputDir, "bin", filepath.Base(binaryPath))
-	dotPrefixedDestPath := filepath.Join(filepath.Dir(destPath), "."+filepath.Base(destPath))
+	destPath := filepath.Join(outputDir, "bin", "."+filepath.Base(binaryPath))
 
 	fileInfo, err := os.Lstat(binaryPath)
 	if err != nil {
@@ -295,20 +302,10 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 	// Copy the binary with a dot prefix
 	fileOperations = append(fileOperations, FileOperation{
 		Source:      binaryPath,
-		Destination: dotPrefixedDestPath,
+		Destination: destPath,
 		IsSymlink:   false,
 		IsDirectory: false,
 		Permissions: fileInfo.Mode().Perm(),
-	})
-
-	// Add a symlink operation for the wrapper
-	fileOperations = append(fileOperations, FileOperation{
-		Source:      "./wrapper",
-		Destination: destPath,
-		IsSymlink:   true,
-		LinkTarget:  "./wrapper",
-		IsDirectory: false,
-		Permissions: 0755,
 	})
 
 	// Plan shared libraries copy operations
@@ -332,6 +329,29 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 	}
 
 	return fileOperations, nil
+}
+
+func createSymlinks() error {
+	binDir := filepath.Join(outputDir, "bin")
+	files, err := os.ReadDir(binDir)
+	if err != nil {
+		return fmt.Errorf("error reading bin directory: %v", err)
+	}
+
+	// Create symlinks
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), ".") && file.Name() != ".wrapper" {
+			execName := strings.TrimPrefix(file.Name(), ".")
+			symlinkPath := filepath.Join(binDir, execName)
+			if err := os.Symlink("./wrapper", symlinkPath); err != nil {
+				fmt.Printf("Warning: Error creating symlink for %s: %v\n", execName, err)
+			} else if verboseFlag {
+				fmt.Printf("Created symlink: %s -> ./wrapper\n", symlinkPath)
+			}
+		}
+	}
+
+	return nil
 }
 
 func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
@@ -450,50 +470,30 @@ func isSystemLibrary(path string) bool {
 }
 
 func executeFileOperations(fileOperations []FileOperation) error {
-    var errors []string
+	var errors []string
 
-    for _, op := range fileOperations {
-        var err error
+	for _, op := range fileOperations {
+		var err error
 
-        if op.IsSymlink {
-            err = createSymlink(op)
-        } else if op.IsDirectory {
-            err = os.MkdirAll(op.Destination, 0777)
-        } else {
-            err = copyFileWithIO(op.Source, op.Destination)
-        }
+		if op.IsSymlink {
+			err = createSymlink(op)
+		} else if op.IsDirectory {
+			err = os.MkdirAll(op.Destination, 0777)
+		} else {
+			err = copyFileWithIO(op.Source, op.Destination)
+		}
 
-        if err != nil {
-            errors = append(errors, fmt.Sprintf("Error processing %s: %v", op.Source, err))
-            fmt.Printf("Warning: %s\n", errors[len(errors)-1])
-        }
-    }
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Error processing %s: %v", op.Source, err))
+			fmt.Printf("Warning: %s\n", errors[len(errors)-1])
+		}
+	}
 
-    // Create symlinks for executables
-    files, err := os.ReadDir(filepath.Join(outputDir, "bin"))
-    if err != nil {
-        return fmt.Errorf("error reading bin directory: %v", err)
-    }
+	if len(errors) > 0 {
+		return fmt.Errorf("encountered %d errors during file operations:\n%s", len(errors), strings.Join(errors, "\n"))
+	}
 
-    for _, file := range files {
-        if !file.IsDir() && strings.HasPrefix(file.Name(), ".") {
-            execName := strings.TrimPrefix(file.Name(), ".")
-            symlinkPath := filepath.Join(outputDir, "bin", execName)
-            err := os.Symlink("./wrapper", symlinkPath)
-            if err != nil {
-                errors = append(errors, fmt.Sprintf("Error creating symlink for %s: %v", execName, err))
-                fmt.Printf("Warning: %s\n", errors[len(errors)-1])
-            } else if verboseFlag {
-                fmt.Printf("Created symlink: %s -> ./wrapper\n", symlinkPath)
-            }
-        }
-    }
-
-    if len(errors) > 0 {
-        return fmt.Errorf("encountered %d errors during file operations:\n%s", len(errors), strings.Join(errors, "\n"))
-    }
-
-    return nil
+	return nil
 }
 
 func writeManifest(fileOperations []FileOperation) error {
