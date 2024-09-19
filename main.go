@@ -283,6 +283,17 @@ func copyBinaryAndLibs(binary string) error {
 		}
 	}
 
+	// Handle nix packages
+	if isNixPkg(binaryPath) {
+		if verboseFlag {
+			fmt.Printf("Detected nix package: %s\n", binaryPath)
+		}
+		err = copyNixPkgFiles(binaryPath)
+		if err != nil {
+			return fmt.Errorf("error copying nix package files for %s: %v", binary, err)
+		}
+	}
+
 	return nil
 }
 
@@ -782,6 +793,50 @@ func renameAndCreateSymlink(executablePath string) error {
 
 	if verboseFlag {
 		fmt.Printf("Renamed executable to: %s and created symlink to wrapper: %s\n", dotPrefixedName, executablePath)
+	}
+
+	return nil
+}
+
+func isNixPkg(path string) bool {
+	return strings.Contains(path, "/nix/store/")
+}
+
+func copyNixPkgFiles(binaryPath string) error {
+	nixPkgDir := filepath.Dir(filepath.Dir(binaryPath))
+
+	err := filepath.Walk(nixPkgDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				return fmt.Errorf("error copying nix package files: %v", err)
+			}
+			return err
+		}
+
+		relPath, err := filepath.Rel(nixPkgDir, path)
+		if err != nil {
+			return err
+		}
+
+		destPath := filepath.Join(outputDir, relPath)
+
+		if info.IsDir() {
+			err = os.MkdirAll(destPath, 0755)
+			if err != nil {
+				return fmt.Errorf("error copying nix package files: %v", err)
+			}
+		} else {
+			err = copyFileWithIO(path, destPath)
+			if err != nil {
+				return fmt.Errorf("error copying nix package files: %v", err)
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("error copying nix package files: %v", err)
 	}
 
 	return nil
