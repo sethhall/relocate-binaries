@@ -22,6 +22,7 @@ var (
 	outputDir        string
 	finalInstallPath string
 	forceFlag        bool
+	dryRunFlag       bool
 	externalTools    = map[string][]string{
 		"darwin": {"otool", "install_name_tool"},
 		"linux":  {"ldd", "patchelf", "file"},
@@ -30,6 +31,13 @@ var (
 
 //go:embed wrapper.c
 var wrapperSource embed.FS
+
+type FileOperation struct {
+	Source      string
+	Destination string
+	IsSymlink   bool
+	LinkTarget  string
+}
 
 func init() {
 	flag.Func("p", "Specify a binary to package (can be used multiple times)", func(s string) error {
@@ -40,6 +48,7 @@ func init() {
 	flag.BoolVar(&verboseFlag, "v", false, "Enable verbose output")
 	flag.BoolVar(&archiveFlag, "archive", false, "Create a compressed archive of the final bundle")
 	flag.BoolVar(&forceFlag, "f", false, "Force the tool to proceed even if the output directory exists")
+	flag.BoolVar(&dryRunFlag, "dry-run", false, "Enable dry-run mode")
 	flag.StringVar(&outputDir, "output", "output", "Specify the output directory")
 	flag.StringVar(&finalInstallPath, "install-path", "", "Specify the final installation path for the package")
 	flag.Usage = usage
@@ -54,7 +63,7 @@ It copies the binaries, their shared libraries, and sets up the correct RPATH.
 
 Usage:
 
-  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>] [-f]
+  %s -p <binary1> [-p <binary2> ...] [-v] [-archive] [-output <directory>] [-install-path <path>] [-f] [--dry-run]
 
 Flags:
 
@@ -151,16 +160,34 @@ func main() {
 		}
 	}
 
-	// Copy specified binaries and their shared libraries
+	// Planning stage: Build the list of FileOperation structs
+	var fileOperations []FileOperation
 	for _, binary := range binaries {
-		err := copyBinaryAndLibs(binary)
+		ops, err := planFileOperations(binary)
 		if err != nil {
-			fmt.Printf("Error processing binary %s: %v\n", binary, err)
+			fmt.Printf("Error planning file operations for binary %s: %v\n", binary, err)
 			if strings.Contains(err.Error(), "missing libraries") {
 				fmt.Println("Failure due to missing libraries!")
 				os.Exit(1)
 			}
 		}
+		fileOperations = append(fileOperations, ops...)
+	}
+
+	// Dry-run mode: Print the planned operations and exit
+	if dryRunFlag {
+		fmt.Println("Dry-run mode enabled. Planned file operations:")
+		for _, op := range fileOperations {
+			fmt.Printf("Source: %s, Destination: %s, IsSymlink: %t, LinkTarget: %s\n", op.Source, op.Destination, op.IsSymlink, op.LinkTarget)
+		}
+		return
+	}
+
+	// Execution stage: Perform the file operations
+	err = executeFileOperations(fileOperations)
+	if err != nil {
+		fmt.Printf("Error executing file operations: %v\n", err)
+		return
 	}
 
 	// Set permissions recursively
@@ -233,78 +260,61 @@ func checkExternalTools() error {
 	return nil
 }
 
-func copyBinaryAndLibs(binary string) error {
+func planFileOperations(binary string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
+
 	// Find the binary
 	binaryPath, err := exec.LookPath(binary)
 	if err != nil {
-		return fmt.Errorf("error finding %s: %v", binary, err)
+		return nil, fmt.Errorf("error finding %s: %v", binary, err)
 	}
 
 	// Get absolute path
 	binaryPath, err = filepath.Abs(binaryPath)
 	if err != nil {
-		return fmt.Errorf("error getting absolute path for %s: %v", binary, err)
+		return nil, fmt.Errorf("error getting absolute path for %s: %v", binary, err)
 	}
 
-	// Create the output directory if it does not exist
-	err = os.MkdirAll(filepath.Join(outputDir, "bin"), 0755)
-	if err != nil {
-		return fmt.Errorf("error creating output directory: %v", err)
-	}
-
-	// Copy the binary to final location
+	// Plan the binary copy operation
 	destPath := filepath.Join(outputDir, "bin", filepath.Base(binaryPath))
-	err = copyFileWithIO(binaryPath, destPath)
+	fileOperations = append(fileOperations, FileOperation{
+		Source:      binaryPath,
+		Destination: destPath,
+		IsSymlink:   false,
+	})
+
+	// Plan shared libraries copy operations
+	ops, err := planSharedLibraries(binaryPath)
 	if err != nil {
-		return fmt.Errorf("error copying binary %s: %v", binary, err)
+		return nil, fmt.Errorf("error planning shared libraries for %s: %v", binary, err)
 	}
-
-	if verboseFlag {
-		fmt.Printf("Copied binary: %s to %s\n", binaryPath, destPath)
-	}
-
-	// Copy shared libraries
-	err = copySharedLibraries(binaryPath)
-	if err != nil {
-		return fmt.Errorf("error copying shared libraries for %s: %v", binary, err)
-	}
-
-	// Set RPATH for the copied binary
-	err = addRPATHLinux(destPath)
-	if err != nil {
-		return fmt.Errorf("error setting RPATH for %s: %v", destPath, err)
-	}
-
-	// Rename the original executable with a dot prefix and create a symlink to the wrapper tool on Linux
-	if runtime.GOOS == "linux" {
-		err = renameAndCreateSymlink(destPath)
-		if err != nil {
-			return fmt.Errorf("error renaming and creating symlink for %s: %v", destPath, err)
-		}
-	}
+	fileOperations = append(fileOperations, ops...)
 
 	// Handle nix packages
 	if isNixPkg(binaryPath) {
 		if verboseFlag {
 			fmt.Printf("Detected nix package: %s\n", binaryPath)
 		}
-		err = copyNixPkgFiles(binaryPath)
+		ops, err := planNixPkgFiles(binaryPath)
 		if err != nil {
-			return fmt.Errorf("error copying nix package files for %s: %v", binary, err)
+			return nil, fmt.Errorf("error planning nix package files for %s: %v", binary, err)
 		}
+		fileOperations = append(fileOperations, ops...)
 	}
 
-	return nil
+	return fileOperations, nil
 }
 
-func copySharedLibraries(binaryPath string) error {
+func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
+
 	if verboseFlag {
-		fmt.Printf("Copying shared libraries for: %s\n", binaryPath)
+		fmt.Printf("Planning shared libraries for: %s\n", binaryPath)
 	}
 
 	output, err := exec.Command("ldd", binaryPath).Output()
 	if err != nil {
-		return fmt.Errorf("error listing shared libraries: %v", err)
+		return nil, fmt.Errorf("error listing shared libraries: %v", err)
 	}
 
 	lines := strings.Split(string(output), "\n")
@@ -318,48 +328,30 @@ func copySharedLibraries(binaryPath string) error {
 				} else {
 					libPath := parts[2]
 					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-					err := copyFileWithIO(libPath, destPath)
-					if err != nil {
-						fmt.Printf("Warning: Failed to copy %s: %v\n", libPath, err)
-					} else {
-						if verboseFlag {
-							fmt.Printf("Copied: %s to %s\n", libPath, destPath)
-						}
-
-						// Set RPATH for the copied library
-						err = addRPATHLinux(destPath)
-						if err != nil {
-							fmt.Printf("Warning: Failed to set RPATH for %s: %v\n", destPath, err)
-						}
-					}
+					fileOperations = append(fileOperations, FileOperation{
+						Source:      libPath,
+						Destination: destPath,
+						IsSymlink:   false,
+					})
 				}
 			}
 			// Handle ldd output without "=>" when ld-linux- is displayed weird.
 		} else if strings.Contains(line, "ld-linux-") {
 			libPath := strings.Fields(line)[0]
 			destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-			err := copyFileWithIO(libPath, destPath)
-			if err != nil {
-				fmt.Printf("Warning: Failed to copy %s: %v\n", libPath, err)
-			} else {
-				if verboseFlag {
-					fmt.Printf("Copied: %s to %s\n", libPath, destPath)
-				}
-
-				// Set RPATH for the copied library
-				err = addRPATHLinux(destPath)
-				if err != nil {
-					fmt.Printf("Warning: Failed to set RPATH for %s: %v\n", destPath, err)
-				}
-			}
+			fileOperations = append(fileOperations, FileOperation{
+				Source:      libPath,
+				Destination: destPath,
+				IsSymlink:   false,
+			})
 		}
 	}
 
 	if len(missingLibraries) > 0 {
-		return fmt.Errorf("missing libraries: %v", missingLibraries)
+		return nil, fmt.Errorf("missing libraries: %v", missingLibraries)
 	}
 
-	return nil
+	return fileOperations, nil
 }
 
 func isSystemLibrary(path string) bool {
@@ -373,6 +365,29 @@ func isSystemLibrary(path string) bool {
 		}
 	}
 	return false
+}
+
+func executeFileOperations(fileOperations []FileOperation) error {
+	for _, op := range fileOperations {
+		if op.IsSymlink {
+			err := os.Symlink(op.LinkTarget, op.Destination)
+			if err != nil {
+				return fmt.Errorf("error creating symlink: %v", err)
+			}
+			if verboseFlag {
+				fmt.Printf("Successfully created symlink: %s -> %s\n", op.Destination, op.LinkTarget)
+			}
+		} else {
+			err := copyFileWithIO(op.Source, op.Destination)
+			if err != nil {
+				return fmt.Errorf("error copying file: %v", err)
+			}
+			if verboseFlag {
+				fmt.Printf("Successfully copied: %s to %s\n", op.Source, op.Destination)
+			}
+		}
+	}
+	return nil
 }
 
 func copyFileWithIO(src, dst string) error {
@@ -405,6 +420,19 @@ func copyFileWithIO(src, dst string) error {
 		linkTarget, err := os.Readlink(src)
 		if err != nil {
 			return fmt.Errorf("error reading symlink: %v", err)
+			}
+		// Check if the target of the symlink is within the final output directory
+		absLinkTarget, err := filepath.Abs(linkTarget)
+		if err != nil {
+			return fmt.Errorf("error getting absolute path of symlink target: %v", err)
+		}
+		if strings.HasPrefix(absLinkTarget, outputDir) {
+			// Create a relative symlink if the target is in the final output directory
+			relLinkTarget, err := filepath.Rel(filepath.Dir(dst), absLinkTarget)
+			if err != nil {
+				return fmt.Errorf("error getting relative path of symlink target: %v", err)
+			}
+			linkTarget = relLinkTarget
 		}
 		// Create the symlink at the destination
 		err = os.Symlink(linkTarget, dst)
@@ -802,13 +830,14 @@ func isNixPkg(path string) bool {
 	return strings.Contains(path, "/nix/store/")
 }
 
-func copyNixPkgFiles(binaryPath string) error {
+func planNixPkgFiles(binaryPath string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
 	nixPkgDir := filepath.Dir(filepath.Dir(binaryPath))
 
 	err := filepath.Walk(nixPkgDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if os.IsPermission(err) {
-				return fmt.Errorf("error copying nix package files: %v", err)
+				return fmt.Errorf("error planning nix package files: %v", err)
 			}
 			return err
 		}
@@ -821,23 +850,25 @@ func copyNixPkgFiles(binaryPath string) error {
 		destPath := filepath.Join(outputDir, relPath)
 
 		if info.IsDir() {
-			err = os.MkdirAll(destPath, 0755)
-			if err != nil {
-				return fmt.Errorf("error copying nix package files: %v", err)
-			}
+			fileOperations = append(fileOperations, FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsSymlink:   false,
+			})
 		} else {
-			err = copyFileWithIO(path, destPath)
-			if err != nil {
-				return fmt.Errorf("error copying nix package files: %v", err)
-			}
+			fileOperations = append(fileOperations, FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsSymlink:   false,
+			})
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		return fmt.Errorf("error copying nix package files: %v", err)
+		return nil, fmt.Errorf("error planning nix package files: %v", err)
 	}
 
-	return nil
+	return fileOperations, nil
 }
