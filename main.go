@@ -265,6 +265,9 @@ func copyBinaryAndLibs(binary string) error {
 
 	// Check if the binary is a nix package
 	if isNixPkg(binaryPath) {
+		if verboseFlag {
+			fmt.Printf("Detected nix package: %s - Copying other package files...\n", binaryPath)
+		}
 		err = copyNixPkgFiles(binaryPath)
 		if err != nil {
 			return fmt.Errorf("error copying nix package files for %s: %v", binary, err)
