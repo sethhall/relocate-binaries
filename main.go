@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"embed"
 	"encoding/json"
@@ -24,6 +25,7 @@ var (
 	finalInstallPath string
 	forceFlag        bool
 	dryRunFlag       bool
+	bundleIgnoreFile string
 	externalTools    = map[string][]string{
 		"darwin": {"otool", "install_name_tool"},
 		"linux":  {"ldd", "patchelf", "file"},
@@ -54,6 +56,7 @@ func init() {
 	flag.BoolVar(&dryRunFlag, "dry-run", false, "Enable dry-run mode")
 	flag.StringVar(&outputDir, "output", "output", "Specify the output directory")
 	flag.StringVar(&finalInstallPath, "install-path", "", "Specify the final installation path for the package")
+	flag.StringVar(&bundleIgnoreFile, "ignore-file", "", "Specify the path to the bundle ignore file")
 	flag.Usage = usage
 }
 
@@ -163,19 +166,33 @@ func main() {
 		}
 	}
 
-	// Planning stage: Build the list of FileOperation structs
-	var fileOperations []FileOperation
-	for _, binary := range binaries {
-		ops, err := planFileOperations(binary)
+	var ignorePatterns []string
+
+	if bundleIgnoreFile != "" {
+		ignorePatterns, err = readIgnoreFile(bundleIgnoreFile)
 		if err != nil {
-			fmt.Printf("Error planning file operations for binary %s: %v\n", binary, err)
-			if strings.Contains(err.Error(), "missing libraries") {
-				fmt.Println("Failure due to missing libraries!")
-				os.Exit(1)
-			}
+			fmt.Printf("Error reading ignore file: %v\n", err)
+			// Continue without ignore patterns if there's an error
 		}
-		fileOperations = append(fileOperations, ops...)
 	}
+
+    // Planning stage: Build the list of FileOperation structs
+    var allFileOperations []FileOperation
+    for _, binary := range binaries {
+        ops, err := planFileOperations(binary, ignorePatterns)
+        if err != nil {
+            fmt.Printf("Error planning file operations for binary %s: %v\n", binary, err)
+            if strings.Contains(err.Error(), "missing libraries") {
+                fmt.Println("Failure due to missing libraries!")
+                os.Exit(1)
+            }
+        }
+        allFileOperations = append(allFileOperations, ops...)
+    }
+
+    // Filter out ignored files
+    fileOperations := filterIgnoredFiles(allFileOperations, ignorePatterns)
+
 
 	// Dry-run mode: Print the planned operations and exit
 	if dryRunFlag {
@@ -281,7 +298,103 @@ func checkExternalTools() error {
 	return nil
 }
 
-func planFileOperations(binary string) ([]FileOperation, error) {
+func readIgnoreFile(ignoreFilePath string) ([]string, error) {
+	file, err := os.Open(ignoreFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No ignore file found, return empty list
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		pattern := strings.TrimSpace(scanner.Text())
+		if pattern != "" && !strings.HasPrefix(pattern, "#") {
+			patterns = append(patterns, pattern)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return patterns, nil
+}
+
+func shouldIgnore(path string, ignorePatterns []string) bool {
+	// Normalize the path to use forward slashes
+	normalizedPath := filepath.ToSlash(path)
+
+	for _, pattern := range ignorePatterns {
+		// Normalize the pattern to use forward slashes
+		normalizedPattern := filepath.ToSlash(pattern)
+
+		// Check if the pattern matches from the left
+		if strings.HasPrefix(normalizedPath, normalizedPattern) {
+			// If the pattern exactly matches the path, or the next character is a slash
+			// (indicating the pattern matches a directory), we should ignore this path
+			if len(normalizedPath) == len(normalizedPattern) ||
+				(len(normalizedPath) > len(normalizedPattern) && normalizedPath[len(normalizedPattern)] == '/') {
+				return true
+			}
+		}
+
+		// Handle wildcard patterns
+		if strings.Contains(normalizedPattern, "*") {
+			if matchWildcard(normalizedPath, normalizedPattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func matchWildcard(path, pattern string) bool {
+	parts := strings.Split(pattern, "/")
+	pathParts := strings.Split(path, "/")
+
+	for i, part := range parts {
+		if i >= len(pathParts) {
+			// If we've reached the end of the path but not the pattern,
+			// it's only a match if the rest of the pattern parts are all "*"
+			for _, remainingPart := range parts[i:] {
+				if remainingPart != "*" {
+					return false
+				}
+			}
+			return true
+		}
+
+		if part == "*" {
+			continue
+		}
+
+		matched, err := filepath.Match(part, pathParts[i])
+		if err != nil || !matched {
+			return false
+		}
+	}
+
+	// If we've matched all parts of the pattern but there's still more to the path,
+	// it's a match (because we're matching from the left)
+	return true
+}
+
+func filterIgnoredFiles(ops []FileOperation, ignorePatterns []string) []FileOperation {
+    var filteredOps []FileOperation
+    for _, op := range ops {
+        relPath, err := filepath.Rel(outputDir, op.Destination)
+        if err == nil && !shouldIgnore(relPath, ignorePatterns) {
+            filteredOps = append(filteredOps, op)
+        }
+    }
+    return filteredOps
+}
+
+func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 
 	binaryPath, err := exec.LookPath(binary)
@@ -304,20 +417,21 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 		return nil, fmt.Errorf("error getting file info for %s: %v", binary, err)
 	}
 
-	fileOperations = append(fileOperations, FileOperation{
-		Source:      binaryPath,
-		Destination: destPath,
-		IsSymlink:   false,
-		IsDirectory: false,
-		Permissions: fileInfo.Mode().Perm(),
-	})
+	if !shouldIgnore(binaryPath, ignorePatterns) {
+		fileOperations = append(fileOperations, FileOperation{
+			Source:      binaryPath,
+			Destination: destPath,
+			IsSymlink:   false,
+			IsDirectory: false,
+			Permissions: fileInfo.Mode().Perm(),
+		})
+	}
 
 	// Plan shared libraries copy operations
-	ops, err := planSharedLibraries(binaryPath)
+	ops, err := planSharedLibraries(binaryPath, ignorePatterns)
 	if err != nil {
 		return nil, fmt.Errorf("error planning shared libraries for %s: %v", binary, err)
 	}
-
 	fileOperations = append(fileOperations, ops...)
 
 	// Handle nix packages
@@ -325,7 +439,7 @@ func planFileOperations(binary string) ([]FileOperation, error) {
 		if verboseFlag {
 			fmt.Printf("Detected nix package: %s\n", binaryPath)
 		}
-		ops, err := planNixPkgFiles(binaryPath)
+		ops, err := planNixPkgFiles(binaryPath, ignorePatterns)
 		if err != nil {
 			return nil, fmt.Errorf("error planning nix package files for %s: %v", binary, err)
 		}
@@ -362,7 +476,7 @@ func createSymlinks() error {
 	return nil
 }
 
-func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
+func planSharedLibraries(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	if verboseFlag {
 		fmt.Printf("Planning shared libraries for: %s\n", binaryPath)
 	}
@@ -383,13 +497,13 @@ func planSharedLibraries(binaryPath string) ([]FileOperation, error) {
 	lines := strings.Split(string(output), "\n")
 
 	if runtime.GOOS == "darwin" {
-		return planSharedLibrariesMacOS(lines, binaryPath)
+		return planSharedLibrariesMacOS(lines, binaryPath, ignorePatterns)
 	} else {
-		return planSharedLibrariesLinux(lines, binaryPath)
+		return planSharedLibrariesLinux(lines, binaryPath, ignorePatterns)
 	}
 }
 
-func planSharedLibrariesMacOS(lines []string, binaryPath string) ([]FileOperation, error) {
+func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 	seenDestinations := make(map[string]bool)
 
@@ -397,10 +511,11 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string) ([]FileOperatio
 		if i == 0 || len(strings.TrimSpace(line)) == 0 {
 			continue // Skip the first line (binary path) and empty lines
 		}
+
 		parts := strings.Fields(strings.TrimSpace(line))
 		if len(parts) >= 1 {
 			libPath := parts[0]
-			if !isSystemLibrary(libPath) {
+			if !isSystemLibrary(libPath) && !shouldIgnore(libPath, ignorePatterns) {
 				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
 				fileOps, err := createFileOperation(libPath, destPath)
 				if err != nil {
@@ -419,7 +534,7 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string) ([]FileOperatio
 	return fileOperations, nil
 }
 
-func planSharedLibrariesLinux(lines []string, binaryPath string) ([]FileOperation, error) {
+func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 	seenDestinations := make(map[string]bool)
 	var missingLibraries []string
@@ -432,33 +547,37 @@ func planSharedLibrariesLinux(lines []string, binaryPath string) ([]FileOperatio
 					missingLibraries = append(missingLibraries, parts[0])
 				} else {
 					libPath := parts[2]
-					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-					fileOps, err := createFileOperation(libPath, destPath)
-					if err != nil {
-						return nil, err
-					}
-					for _, op := range fileOps {
-						if !seenDestinations[op.Destination] {
-							fileOperations = append(fileOperations, op)
-							seenDestinations[op.Destination] = true
+					if !isSystemLibrary(libPath) && !shouldIgnore(libPath, ignorePatterns) {
+						destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
+						fileOps, err := createFileOperation(libPath, destPath)
+						if err != nil {
+							return nil, err
+						}
+						for _, op := range fileOps {
+							if !seenDestinations[op.Destination] {
+								fileOperations = append(fileOperations, op)
+								seenDestinations[op.Destination] = true
+							}
 						}
 					}
 				}
 			}
 		} else if strings.Contains(line, "ld-linux-") {
 			libPath := strings.Fields(line)[0]
-			destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-			// Force copy for ld-linux library
-			fileOp := FileOperation{
-				Source:      libPath,
-				Destination: destPath,
-				IsSymlink:   false,
-				IsDirectory: false,
-				Permissions: 0755,
-			}
-			if !seenDestinations[fileOp.Destination] {
-				fileOperations = append(fileOperations, fileOp)
-				seenDestinations[fileOp.Destination] = true
+			if !shouldIgnore(libPath, ignorePatterns) {
+				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
+				// Force copy for ld-linux library
+				fileOp := FileOperation{
+					Source:      libPath,
+					Destination: destPath,
+					IsSymlink:   false,
+					IsDirectory: false,
+					Permissions: 0755,
+				}
+				if !seenDestinations[fileOp.Destination] {
+					fileOperations = append(fileOperations, fileOp)
+					seenDestinations[fileOp.Destination] = true
+				}
 			}
 		}
 	}
@@ -1137,7 +1256,7 @@ func isNixPkg(path string) bool {
 	return strings.Contains(path, "/nix/store/")
 }
 
-func planNixPkgFiles(binaryPath string) ([]FileOperation, error) {
+func planNixPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 
 	nixPkgDir := filepath.Dir(filepath.Dir(binaryPath))
@@ -1162,23 +1281,25 @@ func planNixPkgFiles(binaryPath string) ([]FileOperation, error) {
 
 		destPath := filepath.Join(outputDir, relPath)
 
-		fileOp := FileOperation{
-			Source:      path,
-			Destination: destPath,
-			IsSymlink:   info.Mode()&os.ModeSymlink != 0,
-			IsDirectory: info.IsDir(),
-			Permissions: info.Mode().Perm(),
-		}
-
-		if fileOp.IsSymlink {
-			linkTarget, err := os.Readlink(path)
-			if err != nil {
-				return fmt.Errorf("error reading symlink %s: %v", path, err)
+		if !shouldIgnore(path, ignorePatterns) {
+			fileOp := FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsSymlink:   info.Mode()&os.ModeSymlink != 0,
+				IsDirectory: info.IsDir(),
+				Permissions: info.Mode().Perm(),
 			}
-			fileOp.LinkTarget = linkTarget
-		}
 
-		fileOperations = append(fileOperations, fileOp)
+			if fileOp.IsSymlink {
+				linkTarget, err := os.Readlink(path)
+				if err != nil {
+					return fmt.Errorf("error reading symlink %s: %v", path, err)
+				}
+				fileOp.LinkTarget = linkTarget
+			}
+
+			fileOperations = append(fileOperations, fileOp)
+		}
 
 		return nil
 	})
