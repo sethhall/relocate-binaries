@@ -448,15 +448,17 @@ func planSharedLibrariesLinux(lines []string, binaryPath string) ([]FileOperatio
 		} else if strings.Contains(line, "ld-linux-") {
 			libPath := strings.Fields(line)[0]
 			destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-			fileOps, err := createFileOperation(libPath, destPath)
-			if err != nil {
-				return nil, err
+			// Force copy for ld-linux library
+			fileOp := FileOperation{
+				Source:      libPath,
+				Destination: destPath,
+				IsSymlink:   false,
+				IsDirectory: false,
+				Permissions: 0755,
 			}
-			for _, op := range fileOps {
-				if !seenDestinations[op.Destination] {
-					fileOperations = append(fileOperations, op)
-					seenDestinations[op.Destination] = true
-				}
+			if !seenDestinations[fileOp.Destination] {
+				fileOperations = append(fileOperations, fileOp)
+				seenDestinations[fileOp.Destination] = true
 			}
 		}
 	}
