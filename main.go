@@ -614,6 +614,13 @@ func createFileOperation(sourcePath, destPath string) ([]FileOperation, error) {
 			fileOp.LinkTarget = filepath.Join(filepath.Dir(sourcePath), linkTarget)
 		}
 
+		// Adjust the symlink target to ensure it points within the output directory
+		relPath, err := filepath.Rel(filepath.Dir(destPath), fileOp.LinkTarget)
+		if err != nil {
+			return nil, fmt.Errorf("error calculating relative path: %v", err)
+		}
+		fileOp.LinkTarget = relPath
+
 		// Add the target file as well
 		targetFileOps, err := createFileOperation(fileOp.LinkTarget, filepath.Join(filepath.Dir(destPath), filepath.Base(fileOp.LinkTarget)))
 		if err != nil {
@@ -727,6 +734,11 @@ func createSymlink(op FileOperation) error {
 	} else {
 		// If it's a relative path, we can use it as is
 		linkTarget = originalTarget
+	}
+
+	// Ensure that no symlink points at itself
+	if linkTarget == op.Destination {
+		return fmt.Errorf("symlink %s points at itself", op.Destination)
 	}
 
 	// Remove the destination if it already exists
@@ -1226,7 +1238,7 @@ func renameAndCreateSymlink(executablePath string) error {
 	baseName := filepath.Base(executablePath)
 
 	// Don't rename the wrapper itself
-	if baseName == "wrapper" {
+	if (baseName == "wrapper") {
 		return nil
 	}
 
