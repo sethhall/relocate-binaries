@@ -32,7 +32,7 @@ var (
 	}
 )
 
-//go:embed wrapper.c
+//go:embed wrapper/wrapper.c
 var wrapperSource embed.FS
 
 type FileOperation struct {
@@ -176,23 +176,22 @@ func main() {
 		}
 	}
 
-    // Planning stage: Build the list of FileOperation structs
-    var allFileOperations []FileOperation
-    for _, binary := range binaries {
-        ops, err := planFileOperations(binary, ignorePatterns)
-        if err != nil {
-            fmt.Printf("Error planning file operations for binary %s: %v\n", binary, err)
-            if strings.Contains(err.Error(), "missing libraries") {
-                fmt.Println("Failure due to missing libraries!")
-                os.Exit(1)
-            }
-        }
-        allFileOperations = append(allFileOperations, ops...)
-    }
+	// Planning stage: Build the list of FileOperation structs
+	var allFileOperations []FileOperation
+	for _, binary := range binaries {
+		ops, err := planFileOperations(binary, ignorePatterns)
+		if err != nil {
+			fmt.Printf("Error planning file operations for binary %s: %v\n", binary, err)
+			if strings.Contains(err.Error(), "missing libraries") {
+				fmt.Println("Failure due to missing libraries!")
+				os.Exit(1)
+			}
+		}
+		allFileOperations = append(allFileOperations, ops...)
+	}
 
-    // Filter out ignored files
-    fileOperations := filterIgnoredFiles(allFileOperations, ignorePatterns)
-
+	// Filter out ignored files
+	fileOperations := filterIgnoredFiles(allFileOperations, ignorePatterns)
 
 	// Dry-run mode: Print the planned operations and exit
 	if dryRunFlag {
@@ -384,14 +383,14 @@ func matchWildcard(path, pattern string) bool {
 }
 
 func filterIgnoredFiles(ops []FileOperation, ignorePatterns []string) []FileOperation {
-    var filteredOps []FileOperation
-    for _, op := range ops {
-        relPath, err := filepath.Rel(outputDir, op.Destination)
-        if err == nil && !shouldIgnore(relPath, ignorePatterns) {
-            filteredOps = append(filteredOps, op)
-        }
-    }
-    return filteredOps
+	var filteredOps []FileOperation
+	for _, op := range ops {
+		relPath, err := filepath.Rel(outputDir, op.Destination)
+		if err == nil && !shouldIgnore(relPath, ignorePatterns) {
+			filteredOps = append(filteredOps, op)
+		}
+	}
+	return filteredOps
 }
 
 func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation, error) {
@@ -1191,7 +1190,7 @@ func buildAndInstallWrapper() error {
 	defer os.RemoveAll(tempDir)
 
 	// Write the wrapper source code to a file
-	wrapperSourceData, err := wrapperSource.ReadFile("wrapper.c")
+	wrapperSourceData, err := wrapperSource.ReadFile("wrapper/wrapper.c")
 	if err != nil {
 		return fmt.Errorf("error reading embedded wrapper source code: %v", err)
 	}
