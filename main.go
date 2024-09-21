@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -431,6 +432,7 @@ func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation
 	if err != nil {
 		return nil, fmt.Errorf("error planning shared libraries for %s: %v", binary, err)
 	}
+
 	fileOperations = append(fileOperations, ops...)
 
 	// Handle nix packages
@@ -496,13 +498,13 @@ func planSharedLibraries(binaryPath string, ignorePatterns []string) ([]FileOper
 	lines := strings.Split(string(output), "\n")
 
 	if runtime.GOOS == "darwin" {
-		return planSharedLibrariesMacOS(lines, binaryPath, ignorePatterns)
+		return planSharedLibrariesMacOS(lines, binaryPath, ignorePatterns, outputDir)
 	} else {
-		return planSharedLibrariesLinux(lines, binaryPath, ignorePatterns)
+		return planSharedLibrariesLinux(lines, binaryPath, ignorePatterns, outputDir)
 	}
 }
 
-func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
+func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns []string, outputDir string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 	seenDestinations := make(map[string]bool)
 
@@ -516,7 +518,7 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns 
 			libPath := parts[0]
 			if !isSystemLibrary(libPath) && !shouldIgnore(libPath, ignorePatterns) {
 				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-				fileOps, err := createFileOperation(libPath, destPath)
+				fileOps, err := createFileOperation(libPath, destPath, outputDir)
 				if err != nil {
 					return nil, err
 				}
@@ -533,7 +535,7 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns 
 	return fileOperations, nil
 }
 
-func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
+func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns []string, outputDir string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 	seenDestinations := make(map[string]bool)
 	var missingLibraries []string
@@ -544,20 +546,13 @@ func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns 
 			if len(parts) >= 3 {
 				if parts[2] == "not" {
 					missingLibraries = append(missingLibraries, parts[0])
-				} else {
-					libPath := parts[2]
-					if !isSystemLibrary(libPath) && !shouldIgnore(libPath, ignorePatterns) {
-						destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-						fileOps, err := createFileOperation(libPath, destPath)
-						if err != nil {
-							return nil, err
-						}
-						for _, op := range fileOps {
-							if !seenDestinations[op.Destination] {
-								fileOperations = append(fileOperations, op)
-								seenDestinations[op.Destination] = true
-							}
-						}
+					continue
+				}
+				libPath := parts[2]
+				if !isSystemLibrary(libPath) && !shouldIgnore(libPath, ignorePatterns) {
+					destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
+					if err := addFileOperation(libPath, destPath, &fileOperations, seenDestinations); err != nil {
+						return nil, err
 					}
 				}
 			}
@@ -565,17 +560,8 @@ func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns 
 			libPath := strings.Fields(line)[0]
 			if !shouldIgnore(libPath, ignorePatterns) {
 				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
-				// Force copy for ld-linux library
-				fileOp := FileOperation{
-					Source:      libPath,
-					Destination: destPath,
-					IsSymlink:   false,
-					IsDirectory: false,
-					Permissions: 0755,
-				}
-				if !seenDestinations[fileOp.Destination] {
-					fileOperations = append(fileOperations, fileOp)
-					seenDestinations[fileOp.Destination] = true
+				if err := addFileOperation(libPath, destPath, &fileOperations, seenDestinations); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -588,48 +574,95 @@ func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns 
 	return fileOperations, nil
 }
 
-func createFileOperation(sourcePath, destPath string) ([]FileOperation, error) {
+func addFileOperation(source, dest string, operations *[]FileOperation, seen map[string]bool) error {
+	if seen[dest] {
+		return nil
+	}
+
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+
+	op := FileOperation{
+		Source:      source,
+		Destination: dest,
+		IsSymlink:   false,
+		IsDirectory: info.IsDir(),
+		Permissions: info.Mode().Perm(),
+	}
+
+	*operations = append(*operations, op)
+	seen[dest] = true
+
+	return nil
+}
+
+func createFileOperation(sourcePath, destPath string, baseDir string) ([]FileOperation, error) {
+	log.Printf("DEBUG: Starting createFileOperation for sourcePath: %s, destPath: %s, baseDir: %s", sourcePath, destPath, baseDir)
+
 	fileInfo, err := os.Lstat(sourcePath)
 	if err != nil {
+		log.Printf("ERROR: Failed to get file info for %s: %v", sourcePath, err)
 		return nil, fmt.Errorf("error getting file info for %s: %v", sourcePath, err)
 	}
 
+	log.Printf("DEBUG: File info obtained for %s", sourcePath)
+
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		log.Printf("ERROR: Failed to get absolute path for baseDir %s: %v", baseDir, err)
+		return nil, fmt.Errorf("can't make the baseDir(%s) absolute: %s", baseDir, err)
+	}
+
+	log.Printf("DEBUG: Absolute baseDir: %s", absBaseDir)
+
+	if fileInfo.Mode()&os.ModeSymlink != 0 {
+		log.Printf("DEBUG: File is a symlink")
+		linkTarget, err := os.Readlink(sourcePath)
+		if err != nil {
+			log.Printf("ERROR: Failed to read symlink %s: %v", sourcePath, err)
+			return nil, fmt.Errorf("error reading symlink %s: %v", sourcePath, err)
+		}
+
+		log.Printf("DEBUG: Symlink target: %s", linkTarget)
+
+		// Resolve the absolute path of the link target
+		absLinkTarget := linkTarget
+		if !filepath.IsAbs(linkTarget) {
+			absLinkTarget = filepath.Join(filepath.Dir(sourcePath), linkTarget)
+		}
+
+		// Check if the link target exists
+		targetInfo, err := os.Stat(absLinkTarget)
+		if err != nil {
+			log.Printf("ERROR: Failed to get info for symlink target %s: %v", absLinkTarget, err)
+			return nil, fmt.Errorf("error getting info for symlink target %s: %v", absLinkTarget, err)
+		}
+
+		// Create a FileOperation for the actual file, not the symlink
+		fileOp := FileOperation{
+			Source:      absLinkTarget,
+			Destination: destPath,
+			IsSymlink:   false,
+			IsDirectory: targetInfo.IsDir(),
+			Permissions: targetInfo.Mode().Perm(),
+		}
+
+		log.Printf("DEBUG: Created FileOperation for symlink target: %+v", fileOp)
+		return []FileOperation{fileOp}, nil
+	}
+
+	// If it's not a symlink, proceed as before
 	fileOp := FileOperation{
 		Source:      sourcePath,
 		Destination: destPath,
-		IsSymlink:   fileInfo.Mode()&os.ModeSymlink != 0,
+		IsSymlink:   false,
 		IsDirectory: fileInfo.IsDir(),
 		Permissions: fileInfo.Mode().Perm(),
 	}
 
-	if fileOp.IsSymlink {
-		linkTarget, err := os.Readlink(sourcePath)
-		if err != nil {
-			return nil, fmt.Errorf("error reading symlink %s: %v", sourcePath, err)
-		}
-		fileOp.LinkTarget = linkTarget
-
-		// If the symlink is relative, make it absolute
-		if !filepath.IsAbs(linkTarget) {
-			fileOp.LinkTarget = filepath.Join(filepath.Dir(sourcePath), linkTarget)
-		}
-
-		// Adjust the symlink target to ensure it points within the output directory
-		relPath, err := filepath.Rel(filepath.Dir(destPath), fileOp.LinkTarget)
-		if err != nil {
-			return nil, fmt.Errorf("error calculating relative path: %v", err)
-		}
-		fileOp.LinkTarget = relPath
-
-		// Add the target file as well
-		targetFileOps, err := createFileOperation(fileOp.LinkTarget, filepath.Join(filepath.Dir(destPath), filepath.Base(fileOp.LinkTarget)))
-		if err != nil {
-			return nil, err
-		}
-
-		return append([]FileOperation{fileOp}, targetFileOps...), nil
-	}
-
+	log.Printf("DEBUG: Returning FileOperation: %+v", fileOp)
 	return []FileOperation{fileOp}, nil
 }
 
@@ -1238,7 +1271,7 @@ func renameAndCreateSymlink(executablePath string) error {
 	baseName := filepath.Base(executablePath)
 
 	// Don't rename the wrapper itself
-	if (baseName == "wrapper") {
+	if baseName == "wrapper" {
 		return nil
 	}
 
