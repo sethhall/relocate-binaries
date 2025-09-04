@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 	cmd := exec.Command("go", "build", "-o", builtBinary, "main.go")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Dir = projectRoot(t)
+	cmd.Dir = getProjectRoot()
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build relocate-binaries: %v\n", err)
 		os.Exit(1)
@@ -37,14 +37,19 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func projectRoot(t *testing.T) string {
-	t.Helper()
+func getProjectRoot() string {
 	wd, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("getwd: %v", err)
+		fmt.Fprintf(os.Stderr, "getwd: %v\n", err)
+		os.Exit(1)
 	}
 	// tests/ -> project root
 	return filepath.Dir(wd)
+}
+
+func projectRoot(t *testing.T) string {
+	t.Helper()
+	return getProjectRoot()
 }
 
 func ensureToolsOrSkip(t *testing.T) {
