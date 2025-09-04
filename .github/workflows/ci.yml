@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests on ${{ matrix.os }} with Go
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Linux test dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf file gcc clang
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          go version
+          which go
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            which ldd || true
+            which patchelf || true
+            which file || true
+            which gcc || true
+            which clang || true
+          else
+            which otool || true
+            which install_name_tool || true
+          fi
+
+      - name: Run tests
+        run: |
+          make test
+

@@ -146,26 +146,7 @@ func main() {
 		}
 	}
 
-	// Create directories
-	err = os.MkdirAll(filepath.Join(outputDir, "bin"), 0755)
-	if err != nil {
-		fmt.Printf("Error creating sensor/bin directory: %v\n", err)
-		return
-	}
-	err = os.MkdirAll(filepath.Join(outputDir, "lib"), 0755)
-	if err != nil {
-		fmt.Printf("Error creating sensor/lib directory: %v\n", err)
-		return
-	}
-
-	// Build and install the wrapper tool on Linux
-	if runtime.GOOS == "linux" {
-		err := buildAndInstallWrapper()
-		if err != nil {
-			fmt.Printf("Error building and installing wrapper: %v\n", err)
-			return
-		}
-	}
+	// NOTE: Do not create directories or build artifacts before checking --dry-run.
 
 	var ignorePatterns []string
 
@@ -201,6 +182,27 @@ func main() {
 			fmt.Printf("Source: %s, Destination: %s, IsSymlink: %t, LinkTarget: %s\n", op.Source, op.Destination, op.IsSymlink, op.LinkTarget)
 		}
 		return
+	}
+
+	// Create directories now that we're committed to executing (not a dry run)
+	err = os.MkdirAll(filepath.Join(outputDir, "bin"), 0755)
+	if err != nil {
+		fmt.Printf("Error creating sensor/bin directory: %v\n", err)
+		return
+	}
+	err = os.MkdirAll(filepath.Join(outputDir, "lib"), 0755)
+	if err != nil {
+		fmt.Printf("Error creating sensor/lib directory: %v\n", err)
+		return
+	}
+
+	// Build and install the wrapper tool on Linux
+	if runtime.GOOS == "linux" {
+		err := buildAndInstallWrapper()
+		if err != nil {
+			fmt.Printf("Error building and installing wrapper: %v\n", err)
+			return
+		}
 	}
 
 	// Write the manifest
@@ -265,6 +267,30 @@ func main() {
 		fmt.Printf("Errors occurred while applying final permissions: %v\n", err)
 		// Decide whether to exit here or continue with the rest of the process
 		os.Exit(1)
+	}
+
+	// Code sign binaries and libraries on macOS after modifications
+	if runtime.GOOS == "darwin" {
+		if verboseFlag {
+			fmt.Println("Code signing binaries and libraries...")
+		}
+		for _, dir := range []string{"bin", "lib"} {
+			err = filepath.Walk(filepath.Join(outputDir, dir), func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.IsDir() {
+					err = codeSignBinary(path)
+					if err != nil {
+						fmt.Printf("Warning: Failed to code sign %s: %v\n", path, err)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				fmt.Printf("Error during code signing: %v\n", err)
+			}
+		}
 	}
 
 	if archiveFlag {
@@ -447,6 +473,18 @@ func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation
 		fileOperations = append(fileOperations, ops...)
 	}
 
+	// Handle homebrew packages
+	if isHomebrewPkg(binaryPath) {
+		if verboseFlag {
+			fmt.Printf("Detected homebrew package: %s\n", binaryPath)
+		}
+		ops, err := planHomebrewPkgFiles(binaryPath, ignorePatterns)
+		if err != nil {
+			return nil, fmt.Errorf("error planning homebrew package files for %s: %v", binary, err)
+		}
+		fileOperations = append(fileOperations, ops...)
+	}
+
 	return fileOperations, nil
 }
 
@@ -508,6 +546,16 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns 
 	var fileOperations []FileOperation
 	seenDestinations := make(map[string]bool)
 
+	// Get RPATH entries for resolving @rpath references
+	rpaths, err := getRPATHs(binaryPath)
+	if err != nil {
+		if verboseFlag {
+			fmt.Printf("Warning: Could not get RPATH entries for %s: %v\n", binaryPath, err)
+		}
+		// Continue without RPATH resolution
+		rpaths = []string{}
+	}
+
 	for i, line := range lines {
 		if i == 0 || len(strings.TrimSpace(line)) == 0 {
 			continue // Skip the first line (binary path) and empty lines
@@ -516,6 +564,19 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns 
 		parts := strings.Fields(strings.TrimSpace(line))
 		if len(parts) >= 1 {
 			libPath := parts[0]
+			
+			// Resolve @rpath references
+			if strings.HasPrefix(libPath, "@rpath/") {
+				resolvedPath := resolveRPATH(libPath, rpaths)
+				if resolvedPath == "" {
+					if verboseFlag {
+						fmt.Printf("Warning: Could not resolve %s using RPATH entries: %v\n", libPath, rpaths)
+					}
+					continue // Skip this library if we can't resolve it
+				}
+				libPath = resolvedPath
+			}
+			
 			if !isSystemLibrary(libPath) && !shouldIgnore(libPath, ignorePatterns) {
 				destPath := filepath.Join(outputDir, "lib", filepath.Base(libPath))
 				fileOps, err := createFileOperation(libPath, destPath, outputDir)
@@ -666,6 +727,56 @@ func createFileOperation(sourcePath, destPath string, baseDir string) ([]FileOpe
 	return []FileOperation{fileOp}, nil
 }
 
+func getRPATHs(binaryPath string) ([]string, error) {
+	output, err := exec.Command("otool", "-l", binaryPath).Output()
+	if err != nil {
+		return nil, fmt.Errorf("error running otool -l: %v", err)
+	}
+
+	var rpaths []string
+	lines := strings.Split(string(output), "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "LC_RPATH") {
+			// Look for the path line which should be a few lines after LC_RPATH
+			for j := i + 1; j < len(lines) && j < i+5; j++ {
+				if strings.Contains(lines[j], "path ") {
+					// Extract the path from a line like "         path /opt/homebrew/lib (offset 12)"
+					parts := strings.Fields(lines[j])
+					for k, part := range parts {
+						if part == "path" && k+1 < len(parts) {
+							rpath := parts[k+1]
+							rpaths = append(rpaths, rpath)
+							break
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
+	return rpaths, nil
+}
+
+func resolveRPATH(libPath string, rpaths []string) string {
+	if !strings.HasPrefix(libPath, "@rpath/") {
+		return libPath // Not an @rpath reference
+	}
+
+	// Remove @rpath/ prefix
+	relativePath := strings.TrimPrefix(libPath, "@rpath/")
+
+	// Try each RPATH entry
+	for _, rpath := range rpaths {
+		fullPath := filepath.Join(rpath, relativePath)
+		if _, err := os.Stat(fullPath); err == nil {
+			return fullPath
+		}
+	}
+
+	return "" // Could not resolve
+}
+
 func isSystemLibrary(path string) bool {
 	systemPaths := []string{
 		"/usr/lib",
@@ -680,6 +791,50 @@ func isSystemLibrary(path string) bool {
 		}
 	}
 	return false
+}
+
+func updateLibraryIdentity(libPath string) error {
+	// Get the current library identity
+	output, err := exec.Command("otool", "-D", libPath).Output()
+	if err != nil {
+		return fmt.Errorf("error getting library identity: %v", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	if len(lines) < 2 {
+		return fmt.Errorf("unexpected otool -D output")
+	}
+
+	currentID := strings.TrimSpace(lines[1])
+	libraryName := filepath.Base(libPath)
+	newID := "@rpath/" + libraryName
+
+	// Only update if the current ID is not already using @rpath
+	if currentID != newID && !strings.HasPrefix(currentID, "@rpath/") {
+		cmd := exec.Command("install_name_tool", "-id", newID, libPath)
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("failed to update library identity: %v", err)
+		}
+		if verboseFlag {
+			fmt.Printf("Updated library identity from %s to %s in %s\n", currentID, newID, libPath)
+		}
+	}
+
+	return nil
+}
+
+func codeSignBinary(path string) error {
+	// Re-sign the binary to fix code signature after modifications
+	cmd := exec.Command("codesign", "--force", "--sign", "-", path)
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to code sign %s: %v", path, err)
+	}
+	if verboseFlag {
+		fmt.Printf("Code signed: %s\n", path)
+	}
+	return nil
 }
 
 func executeFileOperations(fileOperations []FileOperation) error {
@@ -1095,6 +1250,14 @@ func processLibrariesMacOS(libPath string) error {
 		return err
 	}
 
+	// Update the library's own identity to use @rpath if it's not a system library
+	if !isSystemLibrary(libPath) {
+		err = updateLibraryIdentity(libPath)
+		if err != nil {
+			fmt.Printf("Warning: Failed to update library identity for %s: %v\n", libPath, err)
+		}
+	}
+
 	output, err := exec.Command("otool", "-L", libPath).Output()
 	if err != nil {
 		return fmt.Errorf("error listing shared libraries for %s: %v", libPath, err)
@@ -1300,6 +1463,14 @@ func isNixPkg(path string) bool {
 	return strings.Contains(path, "/nix/store/")
 }
 
+func isHomebrewPkg(path string) bool {
+	// Check for common Homebrew paths
+	return strings.Contains(path, "/opt/homebrew/Cellar/") || 
+	       strings.Contains(path, "/usr/local/Cellar/") ||
+	       strings.Contains(path, "/opt/homebrew/bin/") ||
+	       strings.Contains(path, "/usr/local/bin/")
+}
+
 func planNixPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 
@@ -1350,6 +1521,106 @@ func planNixPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperatio
 
 	if err != nil {
 		return nil, fmt.Errorf("error planning nix package files: %v", err)
+	}
+
+	return fileOperations, nil
+}
+
+func planHomebrewPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
+
+	// Find the Homebrew package directory
+	// For paths like /opt/homebrew/bin/zeek or /opt/homebrew/Cellar/zeek-full/7.1.1/bin/zeek
+	var homebrewPkgDir string
+	
+	if strings.Contains(binaryPath, "/Cellar/") {
+		// Extract the Cellar path: /opt/homebrew/Cellar/package-name/version/
+		parts := strings.Split(binaryPath, "/Cellar/")
+		if len(parts) >= 2 {
+			// Get the part after /Cellar/
+			cellPart := parts[1]
+			// Split by / and take first two parts (package-name/version)
+			cellParts := strings.Split(cellPart, "/")
+			if len(cellParts) >= 2 {
+				homebrewPkgDir = filepath.Join(parts[0], "Cellar", cellParts[0], cellParts[1])
+			}
+		}
+	} else if strings.Contains(binaryPath, "/opt/homebrew/bin/") || strings.Contains(binaryPath, "/usr/local/bin/") {
+		// For binaries in /opt/homebrew/bin/, we need to find their actual package
+		// This is more complex - we'd need to resolve symlinks and find the real location
+		// For now, let's try to resolve the symlink
+		resolvedPath, err := filepath.EvalSymlinks(binaryPath)
+		if err == nil && strings.Contains(resolvedPath, "/Cellar/") {
+			// Recursively call with the resolved path
+			return planHomebrewPkgFiles(resolvedPath, ignorePatterns)
+		}
+		// If we can't resolve it, we'll skip the homebrew package handling
+		if verboseFlag {
+			fmt.Printf("Warning: Could not resolve homebrew package directory for %s\n", binaryPath)
+		}
+		return fileOperations, nil
+	}
+
+	if homebrewPkgDir == "" {
+		if verboseFlag {
+			fmt.Printf("Warning: Could not determine homebrew package directory for %s\n", binaryPath)
+		}
+		return fileOperations, nil
+	}
+
+	if verboseFlag {
+		fmt.Printf("Planning homebrew package files from: %s\n", homebrewPkgDir)
+	}
+
+	// Walk the Homebrew package directory, similar to Nix packages
+	err := filepath.Walk(homebrewPkgDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				if verboseFlag {
+					fmt.Printf("Warning: Permission denied for %s, skipping\n", path)
+				}
+				return nil // Skip permission denied files/dirs
+			}
+			return err
+		}
+
+		// Skip bin directories (we already handle the binary separately)
+		if info.IsDir() && filepath.Base(path) == "bin" {
+			return filepath.SkipDir
+		}
+
+		relPath, err := filepath.Rel(homebrewPkgDir, path)
+		if err != nil {
+			return err
+		}
+
+		destPath := filepath.Join(outputDir, relPath)
+
+		if !shouldIgnore(relPath, ignorePatterns) {
+			fileOp := FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsSymlink:   info.Mode()&os.ModeSymlink != 0,
+				IsDirectory: info.IsDir(),
+				Permissions: info.Mode().Perm(),
+			}
+
+			if fileOp.IsSymlink {
+				linkTarget, err := os.Readlink(path)
+				if err != nil {
+					return fmt.Errorf("error reading symlink %s: %v", path, err)
+				}
+				fileOp.LinkTarget = linkTarget
+			}
+
+			fileOperations = append(fileOperations, fileOp)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error planning homebrew package files: %v", err)
 	}
 
 	return fileOperations, nil

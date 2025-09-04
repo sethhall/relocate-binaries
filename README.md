@@ -1,5 +1,20 @@
 # Relocate Binaries Tool
 
+[![CI](https://github.com/sethhall/relocate-binaries/actions/workflows/ci.yml/badge.svg)](https://github.com/sethhall/relocate-binaries/actions/workflows/ci.yml)
+
+## Quick Start
+
+```sh
+# Build
+make build
+
+# Dry-run on a binary to preview operations
+./relocate-binaries -p /usr/bin/curl --dry-run -v
+
+# Create a relocatable bundle
+./relocate-binaries -p /usr/bin/curl -output output -install-path /opt/curl
+```
+
 ## Description
 
 The Binary Relocation Tool is a Go program designed for Linux and MacOS to package binaries along with all their dependencies. This tool creates fully self-contained executable packages that can run on systems with minimal or no system libraries, such as containers based on empty file systems.
@@ -15,10 +30,19 @@ The Binary Relocation Tool is a Go program designed for Linux and MacOS to packa
 
 ## Requirements
 
-- Go 1.x (where x is the version you're using)
+- Go 1.23+
 - Access to the target binaries and their associated system libraries
+- macOS: otool, install_name_tool (Xcode Command Line Tools)
+- Linux: ldd, patchelf, file, gcc or clang (for building the Linux wrapper)
 
 ## Installation
+
+Build from source:
+```sh
+make build
+# or
+go build -o relocate-binaries main.go
+```
 
 1. Clone this repository:
    ```
@@ -60,9 +84,51 @@ Flags:
 ```
 
 Examples:
-./relocate-binaries -p /usr/bin/python3
-./relocate-binaries -p /usr/bin/nginx -p /usr/sbin/php-fpm -v
+
+Single binary (verbose):
+```sh
+./relocate-binaries -p /usr/bin/python3 -v -output output -install-path /opt/python
+```
+
+Multiple binaries in one bundle:
+```sh
+./relocate-binaries -p /usr/bin/nginx -p /usr/sbin/php-fpm -v -output web_stack -install-path /opt/web
+```
+
+Use an ignore file to exclude files from the bundle:
+```sh
+# .bundleignore example
+cat > /tmp/.bundleignore <<'EOF'
+lib/*
+/usr/share/doc/*
+*.debug
+EOF
+
+./relocate-binaries -p /usr/bin/python3 -output filtered -ignore-file /tmp/.bundleignore
+```
+
+Create a compressed archive of the bundle:
+```sh
+./relocate-binaries -p /usr/bin/python3 -v -archive -output custom_output -install-path /opt/custom
+# Produces custom_output/ and custom_output.tar.gz
+```
+
+Nix store example:
+```sh
 ./relocate-binaries -p /nix/store/*/bin/zeek -p /nix/store/*/bin/suricata -v -archive -output custom_sensor -install-path /opt/sensor
+```
+
+## macOS vs Linux behavior
+
+- macOS uses otool and install_name_tool to:
+  - Add @executable_path/../lib and @loader_path/../lib RPATHs
+  - Rewrite absolute library paths to @rpath/ relative paths
+  - Recursively process dependent libraries
+- Linux uses ldd and patchelf and introduces a wrapper mechanism:
+  - Original executables are renamed with a dot prefix (e.g., .binary)
+  - A tiny C wrapper is built and placed at bin/wrapper
+  - Symlinks in bin/ point to the wrapper which locates the packaged ld-linux and then runs .binary
+  - RPATH is set to $ORIGIN/../lib and the ELF interpreter can be set to the packaged loader when -install-path is provided
 
 ## Output
 
@@ -95,6 +161,25 @@ output/
 - Ensuring consistent library versions across different deployment environments
 - Isolating applications from system library changes
 
+## Testing
+
+Run the cross-platform integration tests:
+```sh
+make test
+# or
+go test -v ./...
+```
+
+Quick local smoke tests (macOS or Linux):
+```sh
+chmod +x scripts/smoke.sh
+scripts/smoke.sh
+```
+
+Notes:
+- On macOS, tests that exercise non-system library copying prefer /opt/homebrew/bin/python3. If not present, those tests are skipped with guidance.
+- On Linux, ensure ldd, patchelf, file, and gcc or clang are installed.
+
 ## Notes
 
 - This tool requires appropriate permissions to read system libraries and modify binaries.
@@ -104,6 +189,26 @@ output/
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## CI
+
+GitHub Actions runs the test suite on Ubuntu and macOS for pushes and PRs. See the badge above or open the workflow:
+- .github/workflows/ci.yml
+
+## Troubleshooting
+
+- required tool 'X' not found in PATH
+  - Ensure platform tools are installed:
+    - macOS: Xcode Command Line Tools (otool, install_name_tool)
+    - Linux: ldd, patchelf, file, gcc or clang
+- Error: Output directory <dir> already exists. Use -f flag to force
+  - Re-run with -f or remove the directory.
+- Dry-run created files
+  - By design, --dry-run should not create the output directory. If you see files, ensure you didn’t run without --dry-run earlier into the same path.
+- macOS: library copying seems to include only system libs
+  - System libs under /usr/lib and /System/Library are intentionally skipped. Use a non-system binary (e.g., /opt/homebrew/bin/python3) to exercise copying.
+- Linux: wrapper not built
+  - Ensure gcc or clang is present; the wrapper is only compiled on Linux.
 
 ## Disclaimer
 

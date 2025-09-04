@@ -4,5 +4,7 @@ relocate-binaries
 
 # Ignore any output directory
 output/
+test_output/
+smoke_out/
 *.tar.gz
 
