@@ -85,9 +85,26 @@ Special handling for `/nix/store/` packages:
 - Copies entire package directory structure (excluding bin directories)
 - Preserves symlinks and directory hierarchies
 
+### Homebrew Package Support
+
+Special handling for Homebrew packages:
+- Detects Homebrew packages from `/opt/homebrew/Cellar/` or `/usr/local/Cellar/`
+- Resolves symlinks from `/opt/homebrew/bin/` to actual package locations
+- Copies package directory structure (excluding bin directories)
+- Preserves symlinks and directory hierarchies
+
+### vcpkg Package Support
+
+Special handling for vcpkg packages:
+- Detects vcpkg packages from `/vcpkg/installed/<triplet>/` paths
+- Extracts the vcpkg triplet directory (e.g., `x64-linux`, `arm64-osx`)
+- Copies runtime libraries from the `lib/` directory
+- Skips unnecessary directories: `bin/` (handled separately), `include/`, `share/`, `tools/`
+- Flattens vcpkg lib structure into standard output `lib/` directory
+
 ### Key Functions by Responsibility
 
-**Planning**: `planFileOperations()`, `planSharedLibraries()`, `planNixPkgFiles()`
+**Planning**: `planFileOperations()`, `planSharedLibraries()`, `planNixPkgFiles()`, `planHomebrewPkgFiles()`, `planVcpkgPkgFiles()`
 **Execution**: `executeFileOperations()`, `copyFileWithIO()`, `createSymlink()`
 **Platform-specific**: `addRPATHLinux()`, `processLibrariesMacOS()`, `buildAndInstallWrapper()`
 **Filtering**: `shouldIgnore()`, `filterIgnoredFiles()`, `matchWildcard()`

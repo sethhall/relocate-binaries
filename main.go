@@ -485,6 +485,23 @@ func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation
 		fileOperations = append(fileOperations, ops...)
 	}
 
+	// Handle vcpkg packages
+	if isVcpkgPkg(binaryPath) {
+		if verboseFlag {
+			fmt.Printf("Detected vcpkg package: %s\n", binaryPath)
+		}
+		// Mark this triplet as processed to avoid reprocessing in planSharedLibraries
+		tripletDir := getVcpkgTripletDir(binaryPath)
+		if tripletDir != "" {
+			processedVcpkgTriplets[tripletDir] = true
+		}
+		ops, err := planVcpkgPkgFiles(binaryPath, ignorePatterns)
+		if err != nil {
+			return nil, fmt.Errorf("error planning vcpkg package files for %s: %v", binary, err)
+		}
+		fileOperations = append(fileOperations, ops...)
+	}
+
 	return fileOperations, nil
 }
 
@@ -515,6 +532,9 @@ func createSymlinks() error {
 	return nil
 }
 
+// Track vcpkg triplets we've already processed to avoid duplicates
+var processedVcpkgTriplets = make(map[string]bool)
+
 func planSharedLibraries(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	if verboseFlag {
 		fmt.Printf("Planning shared libraries for: %s\n", binaryPath)
@@ -535,11 +555,42 @@ func planSharedLibraries(binaryPath string, ignorePatterns []string) ([]FileOper
 
 	lines := strings.Split(string(output), "\n")
 
+	var fileOps []FileOperation
 	if runtime.GOOS == "darwin" {
-		return planSharedLibrariesMacOS(lines, binaryPath, ignorePatterns, outputDir)
+		fileOps, err = planSharedLibrariesMacOS(lines, binaryPath, ignorePatterns, outputDir)
 	} else {
-		return planSharedLibrariesLinux(lines, binaryPath, ignorePatterns, outputDir)
+		fileOps, err = planSharedLibrariesLinux(lines, binaryPath, ignorePatterns, outputDir)
 	}
+	
+	if err != nil {
+		return nil, err
+	}
+
+	// For each library found, check if it's from vcpkg and handle its dependencies
+	for _, op := range fileOps {
+		if !op.IsDirectory && isVcpkgPkg(op.Source) {
+			// Extract the vcpkg triplet directory to avoid reprocessing
+			tripletDir := getVcpkgTripletDir(op.Source)
+			if tripletDir == "" || processedVcpkgTriplets[tripletDir] {
+				continue
+			}
+			processedVcpkgTriplets[tripletDir] = true
+			
+			if verboseFlag {
+				fmt.Printf("Detected vcpkg library dependency: %s\n", op.Source)
+			}
+			vcpkgOps, err := planVcpkgPkgFiles(op.Source, ignorePatterns)
+			if err != nil {
+				if verboseFlag {
+					fmt.Printf("Warning: Could not plan vcpkg files for library %s: %v\n", op.Source, err)
+				}
+			} else {
+				fileOps = append(fileOps, vcpkgOps...)
+			}
+		}
+	}
+
+	return fileOps, nil
 }
 
 func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns []string, outputDir string) ([]FileOperation, error) {
@@ -567,7 +618,7 @@ func planSharedLibrariesMacOS(lines []string, binaryPath string, ignorePatterns 
 			
 			// Resolve @rpath references
 			if strings.HasPrefix(libPath, "@rpath/") {
-				resolvedPath := resolveRPATH(libPath, rpaths)
+				resolvedPath := resolveRPATH(libPath, rpaths, binaryPath)
 				if resolvedPath == "" {
 					if verboseFlag {
 						fmt.Printf("Warning: Could not resolve %s using RPATH entries: %v\n", libPath, rpaths)
@@ -758,7 +809,7 @@ func getRPATHs(binaryPath string) ([]string, error) {
 	return rpaths, nil
 }
 
-func resolveRPATH(libPath string, rpaths []string) string {
+func resolveRPATH(libPath string, rpaths []string, binaryPath string) string {
 	if !strings.HasPrefix(libPath, "@rpath/") {
 		return libPath // Not an @rpath reference
 	}
@@ -768,6 +819,16 @@ func resolveRPATH(libPath string, rpaths []string) string {
 
 	// Try each RPATH entry
 	for _, rpath := range rpaths {
+		// Expand @loader_path and @executable_path to the binary's directory
+		if strings.HasPrefix(rpath, "@loader_path/") || strings.HasPrefix(rpath, "@executable_path/") {
+			binaryDir := filepath.Dir(binaryPath)
+			if strings.HasPrefix(rpath, "@loader_path/") {
+				rpath = filepath.Join(binaryDir, strings.TrimPrefix(rpath, "@loader_path/"))
+			} else {
+				rpath = filepath.Join(binaryDir, strings.TrimPrefix(rpath, "@executable_path/"))
+			}
+		}
+		
 		fullPath := filepath.Join(rpath, relativePath)
 		if _, err := os.Stat(fullPath); err == nil {
 			return fullPath
@@ -787,6 +848,15 @@ func isSystemLibrary(path string) bool {
 	}
 	for _, sysPath := range systemPaths {
 		if strings.HasPrefix(path, sysPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(slice []string, target string) bool {
+	for _, item := range slice {
+		if item == target {
 			return true
 		}
 	}
@@ -1171,22 +1241,41 @@ func addRPATHMacOS(path string) error {
 		return nil
 	}
 
-	// Add @executable_path/../lib RPATH
-	cmd = exec.Command("install_name_tool", "-add_rpath", "@executable_path/../lib", path)
-	err = cmd.Run()
+	// Get existing RPATHs
+	existingRPATHs, err := getRPATHs(path)
 	if err != nil {
-		return fmt.Errorf("failed to add @executable_path/../lib RPATH for %s: %v", path, err)
+		if verboseFlag {
+			fmt.Printf("Warning: Could not get existing RPATHs for %s: %v\n", path, err)
+		}
+		existingRPATHs = []string{}
 	}
 
-	// Add @loader_path/../lib RPATH
-	cmd = exec.Command("install_name_tool", "-add_rpath", "@loader_path/../lib", path)
-	err = cmd.Run()
-	if err != nil {
-		return fmt.Errorf("failed to add @loader_path/../lib RPATH for %s: %v", path, err)
+	// Add @executable_path/../lib RPATH if not already present
+	if !containsString(existingRPATHs, "@executable_path/../lib") {
+		cmd = exec.Command("install_name_tool", "-add_rpath", "@executable_path/../lib", path)
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("failed to add @executable_path/../lib RPATH for %s: %v", path, err)
+		}
+		if verboseFlag {
+			fmt.Printf("Added @executable_path/../lib RPATH to: %s\n", path)
+		}
+	} else if verboseFlag {
+		fmt.Printf("@executable_path/../lib RPATH already exists in: %s\n", path)
 	}
 
-	if verboseFlag {
-		fmt.Printf("Added RPATHs to: %s\n", path)
+	// Add @loader_path/../lib RPATH if not already present
+	if !containsString(existingRPATHs, "@loader_path/../lib") {
+		cmd = exec.Command("install_name_tool", "-add_rpath", "@loader_path/../lib", path)
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("failed to add @loader_path/../lib RPATH for %s: %v", path, err)
+		}
+		if verboseFlag {
+			fmt.Printf("Added @loader_path/../lib RPATH to: %s\n", path)
+		}
+	} else if verboseFlag {
+		fmt.Printf("@loader_path/../lib RPATH already exists in: %s\n", path)
 	}
 
 	return nil
@@ -1471,6 +1560,56 @@ func isHomebrewPkg(path string) bool {
 	       strings.Contains(path, "/usr/local/bin/")
 }
 
+func isVcpkgPkg(path string) bool {
+	// Check for vcpkg directory structures
+	// Matches patterns like:
+	// - /path/to/vcpkg/installed/<triplet>/
+	// - /path/to/vcpkg_installed/<triplet>/
+	// - /path/to/vcpkg/packages/<package>_<triplet>/
+	// Common triplets: x64-linux, arm64-osx, x64-windows, etc.
+	return strings.Contains(path, "/vcpkg/installed/") || 
+	       strings.Contains(path, "/vcpkg_installed/") ||
+	       strings.Contains(path, "/vcpkg/packages/")
+}
+
+func getVcpkgTripletDir(binaryPath string) string {
+	// Try vcpkg/installed and vcpkg_installed patterns
+	for _, pattern := range []string{"/vcpkg/installed/", "/vcpkg_installed/"} {
+		if strings.Contains(binaryPath, pattern) {
+			parts := strings.Split(binaryPath, pattern)
+			if len(parts) >= 2 {
+				// Get the part after the pattern
+				installedPart := parts[1]
+				// Split by / and take first part (triplet)
+				installedParts := strings.Split(installedPart, "/")
+				if len(installedParts) >= 1 {
+					// Reconstruct the path with the actual directory name used
+					dirName := strings.TrimPrefix(pattern, "/")
+					dirName = strings.TrimSuffix(dirName, "/")
+					return filepath.Join(parts[0], dirName, installedParts[0])
+				}
+			}
+		}
+	}
+	
+	// Try vcpkg/packages pattern: /path/to/vcpkg/packages/<package>_<triplet>/bin/binary
+	if strings.Contains(binaryPath, "/vcpkg/packages/") {
+		parts := strings.Split(binaryPath, "/vcpkg/packages/")
+		if len(parts) >= 2 {
+			// Get the part after the pattern
+			packagesPart := parts[1]
+			// Split by / and take first part (package_triplet)
+			packagesParts := strings.Split(packagesPart, "/")
+			if len(packagesParts) >= 1 {
+				// Return the full package directory: /path/to/vcpkg/packages/<package>_<triplet>
+				return filepath.Join(parts[0], "vcpkg", "packages", packagesParts[0])
+			}
+		}
+	}
+	
+	return ""
+}
+
 func planNixPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 
@@ -1621,6 +1760,153 @@ func planHomebrewPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOpe
 
 	if err != nil {
 		return nil, fmt.Errorf("error planning homebrew package files: %v", err)
+	}
+
+	return fileOperations, nil
+}
+
+func planVcpkgPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
+	var fileOperations []FileOperation
+
+	// Extract the vcpkg installed directory
+	// Path structure: /path/to/vcpkg/installed/<triplet>/bin/binary
+	// We want: /path/to/vcpkg/installed/<triplet>/
+	vcpkgTripletDir := getVcpkgTripletDir(binaryPath)
+
+	if vcpkgTripletDir == "" {
+		if verboseFlag {
+			fmt.Printf("Warning: Could not determine vcpkg triplet directory for %s\n", binaryPath)
+		}
+		return fileOperations, nil
+	}
+
+	if verboseFlag {
+		fmt.Printf("Planning vcpkg package files from: %s\n", vcpkgTripletDir)
+	}
+
+	// Walk the vcpkg triplet directory, collecting libraries and dependencies
+	err := filepath.Walk(vcpkgTripletDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				if verboseFlag {
+					fmt.Printf("Warning: Permission denied for %s, skipping\n", path)
+				}
+				return nil // Skip permission denied files/dirs
+			}
+			return err
+		}
+
+		// Skip bin directories (we already handle the binary separately)
+		if info.IsDir() && filepath.Base(path) == "bin" {
+			return filepath.SkipDir
+		}
+
+	// Skip include directories (headers not needed at runtime)
+	if info.IsDir() && filepath.Base(path) == "include" {
+		return filepath.SkipDir
+	}
+
+	// Skip debug directory (debug symbols)
+	if info.IsDir() && filepath.Base(path) == "debug" {
+		return filepath.SkipDir
+	}
+
+	// Skip tools directory (separate executables)
+	if info.IsDir() && filepath.Base(path) == "tools" {
+		return filepath.SkipDir
+	}
+
+	relPath, err := filepath.Rel(vcpkgTripletDir, path)
+	if err != nil {
+		return err
+	}
+
+	// Define runtime directories we want to include
+	runtimeDirs := []string{"lib", "share", "etc", "var", "spool", "logs"}
+	isRuntimeDir := false
+	for _, dir := range runtimeDirs {
+		if strings.HasPrefix(relPath, dir) || relPath == "." {
+			isRuntimeDir = true
+			break
+		}
+	}
+
+	// Skip files not in runtime directories
+	if !isRuntimeDir && !info.IsDir() {
+		return nil
+	}
+
+	// Map vcpkg directories to output directories
+	var destPath string
+	if strings.HasPrefix(relPath, "lib") {
+		// Strip the "lib/" prefix and put directly in our lib directory
+		libRelPath := strings.TrimPrefix(relPath, "lib/")
+		if libRelPath == "" {
+			// This is the lib directory itself
+			return nil
+		}
+		
+		// Skip pkgconfig and cmake subdirectories
+		if strings.HasPrefix(libRelPath, "pkgconfig/") || strings.HasPrefix(libRelPath, "cmake/") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		destPath = filepath.Join(outputDir, "lib", libRelPath)
+	} else if strings.HasPrefix(relPath, "share") {
+		// Keep share directory structure
+		shareRelPath := strings.TrimPrefix(relPath, "share/")
+		if shareRelPath == "" {
+			// This is the share directory itself
+			return nil
+		}
+		
+		// Skip vcpkg metadata files
+		if strings.HasSuffix(shareRelPath, "vcpkg_abi_info.txt") || strings.HasSuffix(shareRelPath, "vcpkg.spdx.json") {
+			return nil
+		}
+		
+		// Skip cmake configs in share
+		if strings.Contains(shareRelPath, "/cmake/") || strings.HasPrefix(shareRelPath, "cmake/") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		destPath = filepath.Join(outputDir, "share", shareRelPath)
+	} else {
+		// For etc, var, spool, logs - keep directory structure
+		destPath = filepath.Join(outputDir, relPath)
+	}
+
+		if !shouldIgnore(relPath, ignorePatterns) {
+			fileOp := FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsSymlink:   info.Mode()&os.ModeSymlink != 0,
+				IsDirectory: info.IsDir(),
+				Permissions: info.Mode().Perm(),
+			}
+
+			if fileOp.IsSymlink {
+				linkTarget, err := os.Readlink(path)
+				if err != nil {
+					return fmt.Errorf("error reading symlink %s: %v", path, err)
+				}
+				fileOp.LinkTarget = linkTarget
+			}
+
+			fileOperations = append(fileOperations, fileOp)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error planning vcpkg package files: %v", err)
 	}
 
 	return fileOperations, nil
