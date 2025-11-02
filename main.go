@@ -2,8 +2,10 @@ package main
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bufio"
 	"compress/gzip"
+	"debug/pe"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -28,8 +30,9 @@ var (
 	dryRunFlag       bool
 	bundleIgnoreFile string
 	externalTools    = map[string][]string{
-		"darwin": {"otool", "install_name_tool"},
-		"linux":  {"ldd", "patchelf", "file"},
+		"darwin":  {"otool", "install_name_tool"},
+		"linux":   {"ldd", "patchelf", "file"},
+		"windows": {}, // No external tools needed - uses built-in PE parsing
 	}
 )
 
@@ -420,10 +423,30 @@ func filterIgnoredFiles(ops []FileOperation, ignorePatterns []string) []FileOper
 	return filteredOps
 }
 
+func resolveBinaryPath(binary string) (string, error) {
+	// On Windows, auto-append .exe if not present
+	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(binary), ".exe") {
+		// Check if file exists without .exe
+		if _, err := os.Stat(binary); os.IsNotExist(err) {
+			// Try with .exe appended
+			exePath := binary + ".exe"
+			if _, err := os.Stat(exePath); err == nil {
+				binary = exePath
+				if verboseFlag {
+					fmt.Printf("Auto-detected .exe extension: %s\n", binary)
+				}
+			}
+		}
+	}
+
+	// Use exec.LookPath to resolve the binary
+	return exec.LookPath(binary)
+}
+
 func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation, error) {
 	var fileOperations []FileOperation
 
-	binaryPath, err := exec.LookPath(binary)
+	binaryPath, err := resolveBinaryPath(binary)
 	if err != nil {
 		return nil, fmt.Errorf("error finding %s: %v", binary, err)
 	}
@@ -502,6 +525,18 @@ func planFileOperations(binary string, ignorePatterns []string) ([]FileOperation
 		fileOperations = append(fileOperations, ops...)
 	}
 
+	// Handle standalone Windows installs (cmake --install, make install)
+	if isStandaloneWindowsInstall(binaryPath) {
+		if verboseFlag {
+			fmt.Printf("Detected standalone Windows install: %s\n", binaryPath)
+		}
+		ops, err := planStandaloneWindowsInstallFiles(binaryPath, ignorePatterns)
+		if err != nil {
+			return nil, fmt.Errorf("error planning Windows install files for %s: %v", binary, err)
+		}
+		fileOperations = append(fileOperations, ops...)
+	}
+
 	return fileOperations, nil
 }
 
@@ -540,28 +575,33 @@ func planSharedLibraries(binaryPath string, ignorePatterns []string) ([]FileOper
 		fmt.Printf("Planning shared libraries for: %s\n", binaryPath)
 	}
 
-	var output []byte
+	var fileOps []FileOperation
 	var err error
 
-	if runtime.GOOS == "darwin" {
-		output, err = exec.Command("otool", "-L", binaryPath).Output()
-	} else {
-		output, err = exec.Command("ldd", binaryPath).Output()
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("error listing shared libraries: %v", err)
-	}
-
-	lines := strings.Split(string(output), "\n")
-
-	var fileOps []FileOperation
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
+		output, err := exec.Command("otool", "-L", binaryPath).Output()
+		if err != nil {
+			return nil, fmt.Errorf("error listing shared libraries: %v", err)
+		}
+		lines := strings.Split(string(output), "\n")
 		fileOps, err = planSharedLibrariesMacOS(lines, binaryPath, ignorePatterns, outputDir)
-	} else {
+
+	case "linux":
+		output, err := exec.Command("ldd", binaryPath).Output()
+		if err != nil {
+			return nil, fmt.Errorf("error listing shared libraries: %v", err)
+		}
+		lines := strings.Split(string(output), "\n")
 		fileOps, err = planSharedLibrariesLinux(lines, binaryPath, ignorePatterns, outputDir)
+
+	case "windows":
+		fileOps, err = planSharedLibrariesWindows(binaryPath, ignorePatterns, outputDir)
+
+	default:
+		return nil, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
-	
+
 	if err != nil {
 		return nil, err
 	}
@@ -684,6 +724,190 @@ func planSharedLibrariesLinux(lines []string, binaryPath string, ignorePatterns 
 	}
 
 	return fileOperations, nil
+}
+
+func planSharedLibrariesWindows(binaryPath string, ignorePatterns []string, outputDir string) ([]FileOperation, error) {
+	var fileOps []FileOperation
+	processed := make(map[string]bool)
+
+	// Queue of binaries/DLLs to process
+	queue := []string{binaryPath}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		if processed[current] {
+			continue
+		}
+		processed[current] = true
+
+		// Get dependencies
+		deps, err := getDependenciesWindows(current)
+		if err != nil {
+			// Non-fatal - some binaries might not be valid PE files
+			if verboseFlag {
+				fmt.Printf("Warning: Could not get dependencies for %s: %v\n", current, err)
+			}
+			continue
+		}
+
+		for _, dep := range deps {
+			if shouldIgnore(dep, ignorePatterns) {
+				continue
+			}
+
+			// Skip system DLLs
+			if isSystemDLL(dep) {
+				if verboseFlag {
+					fmt.Printf("Skipping system DLL: %s\n", dep)
+				}
+				continue
+			}
+
+			// Add to operations (DLLs go in bin/ on Windows)
+			destPath := filepath.Join(outputDir, "bin", filepath.Base(dep))
+			fileOps = append(fileOps, FileOperation{
+				Source:      dep,
+				Destination: destPath,
+				IsSymlink:   false,
+				IsDirectory: false,
+				Permissions: 0755,
+			})
+
+			// Add to queue for recursive processing
+			queue = append(queue, dep)
+		}
+	}
+
+	return fileOps, nil
+}
+
+func getDependenciesWindows(binaryPath string) ([]string, error) {
+	// Open PE file
+	peFile, err := pe.Open(binaryPath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening PE file: %v", err)
+	}
+	defer peFile.Close()
+
+	// Read Import Directory Table
+	imports, err := peFile.ImportedLibraries()
+	if err != nil {
+		return nil, fmt.Errorf("error reading imports: %v", err)
+	}
+
+	// For each imported DLL, resolve its full path
+	var dllPaths []string
+	for _, dllName := range imports {
+		dllPath, err := findDLL(dllName, binaryPath)
+		if err != nil {
+			// Skip DLLs that can't be found (likely system DLLs)
+			if verboseFlag {
+				fmt.Printf("Could not locate DLL %s: %v\n", dllName, err)
+			}
+			continue
+		}
+		dllPaths = append(dllPaths, dllPath)
+	}
+
+	return dllPaths, nil
+}
+
+func findDLL(dllName string, exePath string) (string, error) {
+	// Windows DLL search order (simplified):
+	// 1. Directory of the exe
+	// 2. System32
+	// 3. SysWOW64 (for 32-bit on 64-bit Windows)
+	// 4. Windows directory
+	// 5. Current directory
+	// 6. Directories in PATH
+
+	searchPaths := []string{
+		filepath.Dir(exePath),
+		".",
+	}
+
+	// Add Windows system directories
+	if systemRoot := os.Getenv("SystemRoot"); systemRoot != "" {
+		searchPaths = append(searchPaths,
+			filepath.Join(systemRoot, "System32"),
+			filepath.Join(systemRoot, "SysWOW64"),
+			systemRoot,
+		)
+	} else {
+		// Fallback if SystemRoot not set
+		searchPaths = append(searchPaths,
+			`C:\Windows\System32`,
+			`C:\Windows\SysWOW64`,
+			`C:\Windows`,
+		)
+	}
+
+	// Add PATH directories
+	pathDirs := filepath.SplitList(os.Getenv("PATH"))
+	searchPaths = append(searchPaths, pathDirs...)
+
+	for _, dir := range searchPaths {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, dllName)
+		if _, err := os.Stat(candidate); err == nil {
+			// Return absolute path
+			absPath, err := filepath.Abs(candidate)
+			if err == nil {
+				return absPath, nil
+			}
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("DLL not found: %s", dllName)
+}
+
+func isSystemDLL(dllPath string) bool {
+	// Skip known system DLLs that are always present
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+
+	// Check if DLL is in Windows system directories
+	lowerPath := strings.ToLower(dllPath)
+	lowerSystemRoot := strings.ToLower(systemRoot)
+	if strings.HasPrefix(lowerPath, lowerSystemRoot) {
+		return true
+	}
+
+	// Known system DLLs that should never be bundled
+	baseName := strings.ToLower(filepath.Base(dllPath))
+	systemDLLs := []string{
+		"kernel32.dll",
+		"ntdll.dll",
+		"user32.dll",
+		"gdi32.dll",
+		"advapi32.dll",
+		"msvcrt.dll",
+		"shell32.dll",
+		"ws2_32.dll",
+		"ole32.dll",
+		"oleaut32.dll",
+		"comctl32.dll",
+		"comdlg32.dll",
+		"bcrypt.dll",
+		"crypt32.dll",
+		"secur32.dll",
+		"rpcrt4.dll",
+	}
+
+	for _, sys := range systemDLLs {
+		if baseName == sys {
+			return true
+		}
+	}
+
+	return false
 }
 
 func addFileOperation(source, dest string, operations *[]FileOperation, seen map[string]bool) error {
@@ -1418,6 +1642,13 @@ func applyFinalPermissions(fileOperations []FileOperation) error {
 }
 
 func createArchive() error {
+	if runtime.GOOS == "windows" {
+		return createZipArchive()
+	}
+	return createTarGzArchive()
+}
+
+func createTarGzArchive() error {
 	archiveName := fmt.Sprintf("%s.tar.gz", outputDir)
 	file, err := os.Create(archiveName)
 	if err != nil {
@@ -1472,6 +1703,74 @@ func createArchive() error {
 		}
 
 		return nil
+	})
+}
+
+func createZipArchive() error {
+	archiveName := fmt.Sprintf("%s.zip", outputDir)
+	file, err := os.Create(archiveName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	zipWriter := zip.NewWriter(file)
+	defer zipWriter.Close()
+
+	return filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Create zip header from file info
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+
+		// Compute relative path for archive
+		relPath, err := filepath.Rel(filepath.Dir(outputDir), path)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(relPath) // Use forward slashes in zip
+
+		// Handle directories
+		if info.IsDir() {
+			header.Name += "/"
+			_, err = zipWriter.CreateHeader(header)
+			return err
+		}
+
+		// Handle symlinks (Windows doesn't really use them, but handle anyway)
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			header.Name += ".symlink"
+			writer, err := zipWriter.CreateHeader(header)
+			if err != nil {
+				return err
+			}
+			_, err = writer.Write([]byte(linkTarget))
+			return err
+		}
+
+		// Handle regular files
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(writer, file)
+		return err
 	})
 }
 
@@ -1608,6 +1907,141 @@ func getVcpkgTripletDir(binaryPath string) string {
 	}
 	
 	return ""
+}
+
+func isStandaloneWindowsInstall(binaryPath string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+
+	// Skip if it's already detected as vcpkg
+	if isVcpkgPkg(binaryPath) {
+		return false
+	}
+
+	// Skip if in system directories
+	if isSystemPath(binaryPath) {
+		return false
+	}
+
+	// Check if parent directory looks like an install prefix
+	installRoot := getStandaloneInstallRoot(binaryPath)
+	return installRoot != ""
+}
+
+func isSystemPath(path string) bool {
+	systemDirs := []string{
+		`C:\Windows`,
+		`C:\Program Files`,
+		`C:\Program Files (x86)`,
+	}
+
+	lowerPath := strings.ToLower(path)
+	for _, dir := range systemDirs {
+		if strings.HasPrefix(lowerPath, strings.ToLower(dir)) {
+			return true
+		}
+	}
+	return false
+}
+
+func getStandaloneInstallRoot(binaryPath string) string {
+	// Binary is typically in <prefix>/bin/binary.exe
+	binDir := filepath.Dir(binaryPath) // e.g., C:\zeek-install\bin
+
+	// Check if this is actually a "bin" directory
+	if filepath.Base(binDir) != "bin" {
+		return "" // Not in bin/ - not a standard install
+	}
+
+	potentialRoot := filepath.Dir(binDir) // e.g., C:\zeek-install
+
+	// Verify it looks like an install root by checking for typical directories
+	// Must have bin/, and at least one other typical directory
+	hasOtherDirs := false
+	typicalDirs := []string{"share", "lib", "etc", "include", "var"}
+
+	for _, dir := range typicalDirs {
+		dirPath := filepath.Join(potentialRoot, dir)
+		if _, err := os.Stat(dirPath); err == nil {
+			hasOtherDirs = true
+			break
+		}
+	}
+
+	if hasOtherDirs {
+		return potentialRoot
+	}
+
+	return ""
+}
+
+func planStandaloneWindowsInstallFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {
+	installRoot := getStandaloneInstallRoot(binaryPath)
+	if installRoot == "" {
+		return nil, fmt.Errorf("could not determine install root")
+	}
+
+	if verboseFlag {
+		fmt.Printf("Detected standalone Windows install root: %s\n", installRoot)
+	}
+
+	var fileOps []FileOperation
+
+	// Walk the ENTIRE install root (copy everything except bin/)
+	err := filepath.Walk(installRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(installRoot, path)
+		if err != nil {
+			return err
+		}
+
+		// Skip bin/ directory - handled separately via DLL discovery
+		if relPath == "bin" || strings.HasPrefix(relPath, "bin"+string(filepath.Separator)) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Check ignore patterns
+		if shouldIgnore(relPath, ignorePatterns) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		destPath := filepath.Join(outputDir, relPath)
+
+		if info.IsDir() {
+			fileOps = append(fileOps, FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsDirectory: true,
+				Permissions: info.Mode().Perm(),
+			})
+		} else {
+			fileOps = append(fileOps, FileOperation{
+				Source:      path,
+				Destination: destPath,
+				IsSymlink:   false,
+				IsDirectory: false,
+				Permissions: info.Mode().Perm(),
+			})
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return fileOps, nil
 }
 
 func planNixPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperation, error) {

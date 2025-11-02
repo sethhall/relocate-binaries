@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -46,9 +46,11 @@ jobs:
             which file || true
             which gcc || true
             which clang || true
-          else
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
             which otool || true
             which install_name_tool || true
+          elif [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "Windows - no external tools required"
           fi
 
       - name: Run tests
