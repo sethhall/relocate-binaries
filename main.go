@@ -1498,15 +1498,8 @@ func addRPATHMacOS(path string) error {
 		return nil
 	}
 
-	// Check if this library has any problematic dependencies before making changes
-	if err := checkProblematicLibrary(path); err != nil {
-		if verboseFlag {
-			fmt.Printf("Skipping %s: %v\n", path, err)
-		}
-		return nil
-	}
-
 	// Strip and preserve any appended data before modifying the binary
+	// This allows us to work with binaries that have data appended after the code signature
 	if err := stripAndPreserveAppendedData(path); err != nil {
 		return fmt.Errorf("failed to strip appended data from %s: %v", path, err)
 	}
