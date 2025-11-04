@@ -280,7 +280,6 @@ func TestPlanStandaloneWindowsInstallFiles(t *testing.T) {
 	}
 
 	testExe := filepath.Join(installRoot, "bin", "app.exe")
-	outputDir := filepath.Join(tempDir, "output")
 
 	// Plan operations
 	ops, err := planStandaloneWindowsInstallFiles(testExe, nil)
