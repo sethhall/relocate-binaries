@@ -240,7 +240,7 @@ func main() {
 			if err != nil {
 				return err
 			}
-			if !info.IsDir() {
+			if !info.IsDir() && info.Mode().IsRegular() {
 				if runtime.GOOS == "darwin" {
 					err = processLibrariesMacOS(path)
 					if err != nil {
@@ -1500,8 +1500,24 @@ func addRPATHMacOS(path string) error {
 
 	// Strip and preserve any appended data before modifying the binary
 	// This allows us to work with binaries that have data appended after the code signature
-	if err := stripAndPreserveAppendedData(path); err != nil {
+	appendedData, err := stripAndPreserveAppendedData(path)
+	if err != nil {
 		return fmt.Errorf("failed to strip appended data from %s: %v", path, err)
+	}
+	// Store appended data for later restoration (after signing)
+	if appendedData != nil {
+		appendedDataMap[path] = appendedData
+	}
+
+	// Remove code signature before modifying the binary
+	// install_name_tool cannot modify signed binaries
+	codesignCmd := exec.Command("codesign", "--remove-signature", path)
+	if err := codesignCmd.Run(); err != nil {
+		if verboseFlag {
+			fmt.Printf("Note: Could not remove signature from %s (may not be signed): %v\n", path, err)
+		}
+	} else if verboseFlag {
+		fmt.Printf("Removed code signature from: %s\n", path)
 	}
 
 	// Get existing RPATHs
@@ -1614,12 +1630,8 @@ func processLibrariesMacOS(libPath string) error {
 		fmt.Printf("Processing library: %s\n", libPath)
 	}
 
+	// updateMacOSLibPaths already calls addRPATHMacOS, so we don't need to call it again
 	err := updateMacOSLibPaths(libPath)
-	if err != nil {
-		return err
-	}
-
-	err = addRPATHMacOS(libPath)
 	if err != nil {
 		return err
 	}
@@ -2407,123 +2419,110 @@ func planVcpkgPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperat
 	return fileOperations, nil
 }
 
-// detectAppendedData checks if a Mach-O binary has data appended after the code signature
-func detectAppendedData(path string) ([]byte, error) {
-	// Read the entire file
-	data, err := os.ReadFile(path)
+// detectAppendedData checks if a Mach-O binary has data appended after __LINKEDIT
+func detectAppendedData(path string) (hasAppended bool, linkeditEnd int64, err error) {
+	cmd := exec.Command("otool", "-l", path)
+	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %v", err)
+		return false, 0, fmt.Errorf("failed to run otool: %v", err)
 	}
 
-	// Run codesign to get the signature bounds
-	cmd := exec.Command("codesign", "-dvv", path)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// File might not be signed, which is fine
-		return nil, nil
-	}
-
-	// Parse the output to find "Signature size"
 	lines := strings.Split(string(output), "\n")
-	var signatureSize int64
-	var codeLimit int64
+	var fileoff, filesize int64
 
-	for _, line := range lines {
-		if strings.Contains(line, "Signature size=") {
-			fmt.Sscanf(line, "Signature size=%d", &signatureSize)
-		}
-		if strings.Contains(line, "CodeDirectory") && strings.Contains(line, "size=") {
-			// This gives us hints about where the signature ends
-			fmt.Sscanf(line, "CodeDirectory v=%*d size=%d", &codeLimit)
+	for i, line := range lines {
+		if strings.Contains(line, "segname __LINKEDIT") {
+			// Parse the next few lines for fileoff and filesize
+			for j := i + 1; j < len(lines) && j < i+10; j++ {
+				if strings.Contains(lines[j], "fileoff") {
+					fmt.Sscanf(strings.TrimSpace(lines[j]), "fileoff %d", &fileoff)
+				}
+				if strings.Contains(lines[j], "filesize") {
+					fmt.Sscanf(strings.TrimSpace(lines[j]), "filesize %d", &filesize)
+					break
+				}
+			}
+			break
 		}
 	}
 
-	// If we have signature info, check if there's data beyond it
-	// The signature is typically at the end of the file
-	// Any data after the signature region is appended data
-	if signatureSize > 0 {
-		fileSize := int64(len(data))
-		// Use otool to find where the code signature actually ends
-		cmd = exec.Command("otool", "-l", path)
-		otoolOutput, err := cmd.Output()
-		if err == nil {
-			// Parse load commands to find LC_CODE_SIGNATURE
-			lines = strings.Split(string(otoolOutput), "\n")
-			var codeSignOffset, codeSignSize int64
-			inCodeSig := false
-
-			for _, line := range lines {
-				if strings.Contains(line, "LC_CODE_SIGNATURE") {
-					inCodeSig = true
-					continue
-				}
-				if inCodeSig {
-					if strings.Contains(line, "dataoff") {
-						fmt.Sscanf(strings.TrimSpace(line), "dataoff %d", &codeSignOffset)
-					}
-					if strings.Contains(line, "datasize") {
-						fmt.Sscanf(strings.TrimSpace(line), "datasize %d", &codeSignSize)
-						break
-					}
-				}
-			}
-
-			if codeSignOffset > 0 && codeSignSize > 0 {
-				sigEnd := codeSignOffset + codeSignSize
-				if fileSize > sigEnd {
-					appendedData := data[sigEnd:]
-					if verboseFlag {
-						fmt.Printf("Detected %d bytes of appended data in %s\n", len(appendedData), path)
-					}
-					return appendedData, nil
-				}
-			}
-		}
+	if fileoff == 0 || filesize == 0 {
+		return false, 0, fmt.Errorf("could not parse __LINKEDIT segment")
 	}
 
-	return nil, nil
+	linkeditEnd = fileoff + filesize
+
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return false, 0, err
+	}
+
+	actualSize := fileInfo.Size()
+	hasAppended = actualSize > linkeditEnd
+
+	return hasAppended, linkeditEnd, nil
 }
 
-// stripAndPreserveAppendedData strips appended data from a binary and stores it
-func stripAndPreserveAppendedData(path string) error {
-	appendedData, err := detectAppendedData(path)
+// stripAndPreserveAppendedData removes appended data and returns it
+func stripAndPreserveAppendedData(path string) ([]byte, error) {
+	hasAppended, linkeditEnd, err := detectAppendedData(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if !hasAppended {
+		return nil, nil // No appended data
+	}
+
+	// Read the appended data
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	_, err = file.Seek(linkeditEnd, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	appendedData, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+
+	if verboseFlag {
+		fmt.Printf("Detected %d bytes of appended data in %s\n", len(appendedData), path)
+	}
+
+	// Truncate the file
+	err = os.Truncate(path, linkeditEnd)
+	if err != nil {
+		return nil, err
+	}
+
+	if verboseFlag {
+		fmt.Printf("Stripped %d bytes of appended data from %s\n", len(appendedData), path)
+	}
+
+	return appendedData, nil
+}
+
+// reappendData adds data back to the end of a file
+func reappendData(path string, data []byte) error {
+	if data == nil || len(data) == 0 {
+		return nil
+	}
+
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0755)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	if appendedData != nil && len(appendedData) > 0 {
-		// Store the appended data
-		appendedDataMap[path] = appendedData
-
-		// Strip the appended data by truncating the file
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("failed to read file: %v", err)
-		}
-
-		newSize := int64(len(data)) - int64(len(appendedData))
-		if err := os.Truncate(path, newSize); err != nil {
-			return fmt.Errorf("failed to truncate file: %v", err)
-		}
-
-		if verboseFlag {
-			fmt.Printf("Stripped %d bytes of appended data from %s\n", len(appendedData), path)
-		}
-	}
-
-	return nil
-}
-
-// reappendData re-appends previously stripped data to a binary
-func reappendData(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	_, err = file.Write(data)
 	if err != nil {
-		return fmt.Errorf("failed to open file for appending: %v", err)
-	}
-	defer f.Close()
-
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("failed to write appended data: %v", err)
+		return err
 	}
 
 	if verboseFlag {
