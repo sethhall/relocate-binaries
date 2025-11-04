@@ -34,6 +34,8 @@ var (
 		"linux":   {"ldd", "patchelf", "file"},
 		"windows": {}, // No external tools needed - uses built-in PE parsing
 	}
+	// Track files with appended data that needs to be restored after signing
+	appendedDataMap = make(map[string][]byte)
 )
 
 //go:embed wrapper/wrapper.c
@@ -264,36 +266,52 @@ func main() {
 		}
 	}
 
+	// Re-sign all modified binaries and libraries on macOS
+	if runtime.GOOS == "darwin" {
+		for _, dir := range []string{"bin", "lib"} {
+			err = filepath.Walk(filepath.Join(outputDir, dir), func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.IsDir() && !info.Mode().IsRegular() {
+					return nil // Skip symlinks
+				}
+				if !info.IsDir() {
+					// Check if it's a Mach-O file
+					cmd := exec.Command("file", path)
+					output, err := cmd.Output()
+					if err == nil && strings.Contains(string(output), "Mach-O") {
+						// Ad-hoc sign it
+						signCmd := exec.Command("codesign", "-s", "-", "-f", path)
+						signOutput, signErr := signCmd.CombinedOutput()
+						if signErr != nil {
+							fmt.Printf("Warning: Failed to sign %s: %v\n%s\n", path, signErr, string(signOutput))
+						} else if verboseFlag {
+							fmt.Printf("Ad-hoc signed: %s\n", path)
+						}
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				fmt.Printf("Error during signing pass: %v\n", err)
+			}
+		}
+
+		// Now re-append any stripped data AFTER signing
+		for path, data := range appendedDataMap {
+			if err := reappendData(path, data); err != nil {
+				fmt.Printf("Warning: Failed to re-append data to %s: %v\n", path, err)
+			}
+		}
+	}
+
 	// Apply final permissions
 	err = applyFinalPermissions(fileOperations)
 	if err != nil {
 		fmt.Printf("Errors occurred while applying final permissions: %v\n", err)
 		// Decide whether to exit here or continue with the rest of the process
 		os.Exit(1)
-	}
-
-	// Code sign binaries and libraries on macOS after modifications
-	if runtime.GOOS == "darwin" {
-		if verboseFlag {
-			fmt.Println("Code signing binaries and libraries...")
-		}
-		for _, dir := range []string{"bin", "lib"} {
-			err = filepath.Walk(filepath.Join(outputDir, dir), func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return err
-				}
-				if !info.IsDir() {
-					err = codeSignBinary(path)
-					if err != nil {
-						fmt.Printf("Warning: Failed to code sign %s: %v\n", path, err)
-					}
-				}
-				return nil
-			})
-			if err != nil {
-				fmt.Printf("Error during code signing: %v\n", err)
-			}
-		}
 	}
 
 	if archiveFlag {
@@ -976,17 +994,32 @@ func createFileOperation(sourcePath, destPath string, baseDir string) ([]FileOpe
 			return nil, fmt.Errorf("error getting info for symlink target %s: %v", absLinkTarget, err)
 		}
 
-		// Create a FileOperation for the actual file, not the symlink
-		fileOp := FileOperation{
+		// Create FileOperations for both the target file and the symlink
+		var ops []FileOperation
+
+		// First, create operation for the actual file
+		targetOp := FileOperation{
 			Source:      absLinkTarget,
-			Destination: destPath,
+			Destination: filepath.Join(filepath.Dir(destPath), filepath.Base(absLinkTarget)),
 			IsSymlink:   false,
 			IsDirectory: targetInfo.IsDir(),
 			Permissions: targetInfo.Mode().Perm(),
 		}
+		ops = append(ops, targetOp)
 
-		log.Printf("DEBUG: Created FileOperation for symlink target: %+v", fileOp)
-		return []FileOperation{fileOp}, nil
+		// Then create the symlink operation
+		symlinkOp := FileOperation{
+			Source:      sourcePath,
+			Destination: destPath,
+			IsSymlink:   true,
+			LinkTarget:  filepath.Base(absLinkTarget),
+			IsDirectory: false,
+			Permissions: fileInfo.Mode().Perm(),
+		}
+		ops = append(ops, symlinkOp)
+
+		log.Printf("DEBUG: Created FileOperations for symlink and target: %+v", ops)
+		return ops, nil
 	}
 
 	// If it's not a symlink, proceed as before
@@ -1465,6 +1498,19 @@ func addRPATHMacOS(path string) error {
 		return nil
 	}
 
+	// Check if this library has any problematic dependencies before making changes
+	if err := checkProblematicLibrary(path); err != nil {
+		if verboseFlag {
+			fmt.Printf("Skipping %s: %v\n", path, err)
+		}
+		return nil
+	}
+
+	// Strip and preserve any appended data before modifying the binary
+	if err := stripAndPreserveAppendedData(path); err != nil {
+		return fmt.Errorf("failed to strip appended data from %s: %v", path, err)
+	}
+
 	// Get existing RPATHs
 	existingRPATHs, err := getRPATHs(path)
 	if err != nil {
@@ -1473,6 +1519,23 @@ func addRPATHMacOS(path string) error {
 		}
 		existingRPATHs = []string{}
 	}
+
+	// Delete old absolute RPATHs (like /opt/homebrew/lib, /usr/local/lib, etc.)
+	for _, rpath := range existingRPATHs {
+		if filepath.IsAbs(rpath) && !strings.HasPrefix(rpath, "@") {
+			cmd = exec.Command("install_name_tool", "-delete_rpath", rpath, path)
+			if err := cmd.Run(); err != nil {
+				if verboseFlag {
+					fmt.Printf("Warning: Could not delete RPATH %s from %s: %v\n", rpath, path, err)
+				}
+			} else if verboseFlag {
+				fmt.Printf("Deleted absolute RPATH %s from: %s\n", rpath, path)
+			}
+		}
+	}
+
+	// Re-read RPATHs after deletion
+	existingRPATHs, _ = getRPATHs(path)
 
 	// Add @executable_path/../lib RPATH if not already present
 	if !containsString(existingRPATHs, "@executable_path/../lib") {
@@ -1506,6 +1569,11 @@ func addRPATHMacOS(path string) error {
 }
 
 func updateMacOSLibPaths(binaryPath string) error {
+	// First, add RPATH entries to the binary if it's a main executable
+	if err := addRPATHMacOS(binaryPath); err != nil {
+		return fmt.Errorf("failed to add RPATH to %s: %v", binaryPath, err)
+	}
+
 	output, err := exec.Command("otool", "-L", binaryPath).Output()
 	if err != nil {
 		return fmt.Errorf("error listing shared libraries: %v", err)
@@ -2344,4 +2412,154 @@ func planVcpkgPkgFiles(binaryPath string, ignorePatterns []string) ([]FileOperat
 	}
 
 	return fileOperations, nil
+}
+
+// detectAppendedData checks if a Mach-O binary has data appended after the code signature
+func detectAppendedData(path string) ([]byte, error) {
+	// Read the entire file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %v", err)
+	}
+
+	// Run codesign to get the signature bounds
+	cmd := exec.Command("codesign", "-dvv", path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// File might not be signed, which is fine
+		return nil, nil
+	}
+
+	// Parse the output to find "Signature size"
+	lines := strings.Split(string(output), "\n")
+	var signatureSize int64
+	var codeLimit int64
+
+	for _, line := range lines {
+		if strings.Contains(line, "Signature size=") {
+			fmt.Sscanf(line, "Signature size=%d", &signatureSize)
+		}
+		if strings.Contains(line, "CodeDirectory") && strings.Contains(line, "size=") {
+			// This gives us hints about where the signature ends
+			fmt.Sscanf(line, "CodeDirectory v=%*d size=%d", &codeLimit)
+		}
+	}
+
+	// If we have signature info, check if there's data beyond it
+	// The signature is typically at the end of the file
+	// Any data after the signature region is appended data
+	if signatureSize > 0 {
+		fileSize := int64(len(data))
+		// Use otool to find where the code signature actually ends
+		cmd = exec.Command("otool", "-l", path)
+		otoolOutput, err := cmd.Output()
+		if err == nil {
+			// Parse load commands to find LC_CODE_SIGNATURE
+			lines = strings.Split(string(otoolOutput), "\n")
+			var codeSignOffset, codeSignSize int64
+			inCodeSig := false
+
+			for _, line := range lines {
+				if strings.Contains(line, "LC_CODE_SIGNATURE") {
+					inCodeSig = true
+					continue
+				}
+				if inCodeSig {
+					if strings.Contains(line, "dataoff") {
+						fmt.Sscanf(strings.TrimSpace(line), "dataoff %d", &codeSignOffset)
+					}
+					if strings.Contains(line, "datasize") {
+						fmt.Sscanf(strings.TrimSpace(line), "datasize %d", &codeSignSize)
+						break
+					}
+				}
+			}
+
+			if codeSignOffset > 0 && codeSignSize > 0 {
+				sigEnd := codeSignOffset + codeSignSize
+				if fileSize > sigEnd {
+					appendedData := data[sigEnd:]
+					if verboseFlag {
+						fmt.Printf("Detected %d bytes of appended data in %s\n", len(appendedData), path)
+					}
+					return appendedData, nil
+				}
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+// stripAndPreserveAppendedData strips appended data from a binary and stores it
+func stripAndPreserveAppendedData(path string) error {
+	appendedData, err := detectAppendedData(path)
+	if err != nil {
+		return err
+	}
+
+	if appendedData != nil && len(appendedData) > 0 {
+		// Store the appended data
+		appendedDataMap[path] = appendedData
+
+		// Strip the appended data by truncating the file
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("failed to read file: %v", err)
+		}
+
+		newSize := int64(len(data)) - int64(len(appendedData))
+		if err := os.Truncate(path, newSize); err != nil {
+			return fmt.Errorf("failed to truncate file: %v", err)
+		}
+
+		if verboseFlag {
+			fmt.Printf("Stripped %d bytes of appended data from %s\n", len(appendedData), path)
+		}
+	}
+
+	return nil
+}
+
+// reappendData re-appends previously stripped data to a binary
+func reappendData(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open file for appending: %v", err)
+	}
+	defer f.Close()
+
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("failed to write appended data: %v", err)
+	}
+
+	if verboseFlag {
+		fmt.Printf("Re-appended %d bytes of data to %s\n", len(data), path)
+	}
+
+	return nil
+}
+
+// checkProblematicLibrary checks if a library has dependencies that would break if modified
+func checkProblematicLibrary(path string) error {
+	// Get the library's dependencies
+	cmd := exec.Command("otool", "-L", path)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil // If we can't check, proceed anyway
+	}
+
+	// Check for problematic dependencies (like Python framework)
+	lines := strings.Split(string(output), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue // Skip the first line (the library itself)
+		}
+		if strings.Contains(line, "Python.framework") ||
+		   strings.Contains(line, "/System/Library/Frameworks/") {
+			return fmt.Errorf("library depends on system frameworks that should not be modified")
+		}
+	}
+
+	return nil
 }
