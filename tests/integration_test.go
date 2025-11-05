@@ -83,6 +83,9 @@ func pickBinariesForPlatform(t *testing.T) (string, string) {
 		}
 		// Fallback: two simple system binaries; tests that rely on non-system libs will skip
 		return "/bin/echo", "/bin/cat"
+	} else if runtime.GOOS == "windows" {
+		// Windows system binaries
+		return `C:\Windows\System32\cmd.exe`, `C:\Windows\System32\notepad.exe`
 	}
 	// Linux defaults
 	return "/bin/ls", "/bin/echo"
