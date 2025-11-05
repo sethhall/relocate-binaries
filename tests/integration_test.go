@@ -25,6 +25,9 @@ func TestMain(m *testing.M) {
 	defer os.RemoveAll(tmpDir)
 
 	builtBinary = filepath.Join(tmpDir, "relocate-binaries")
+	if runtime.GOOS == "windows" {
+		builtBinary += ".exe"
+	}
 	cmd := exec.Command("go", "build", "-o", builtBinary, "main.go")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

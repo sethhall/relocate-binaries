@@ -400,6 +400,13 @@ func shouldIgnore(path string, ignorePatterns []string) bool {
 }
 
 func matchWildcard(path, pattern string) bool {
+	// Special case: if pattern has no slashes, match against basename only
+	if !strings.Contains(pattern, "/") {
+		basename := filepath.Base(path)
+		matched, err := filepath.Match(pattern, basename)
+		return err == nil && matched
+	}
+
 	parts := strings.Split(pattern, "/")
 	pathParts := strings.Split(path, "/")
 
