@@ -2,6 +2,7 @@ package tests
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -171,12 +172,17 @@ func TestArchiveFlag(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "arch")
 	run(t, "-p", bin1, "-output", out, "--archive")
 
-	// Archive should be named "<output>.tar.gz" per implementation
-	archivePath := out + ".tar.gz"
-	mustExistPath(t, archivePath)
-
-	// Verify archive contains manifest and bin binary
-	checkTarGzContains(t, archivePath, []string{"manifest.json", filepath.Join("bin", filepath.Base(bin1))})
+	// Archive format depends on platform: tar.gz on Unix, zip on Windows
+	var archivePath string
+	if runtime.GOOS == "windows" {
+		archivePath = out + ".zip"
+		mustExistPath(t, archivePath)
+		checkZipContains(t, archivePath, []string{"manifest.json", filepath.Join("bin", filepath.Base(bin1))})
+	} else {
+		archivePath = out + ".tar.gz"
+		mustExistPath(t, archivePath)
+		checkTarGzContains(t, archivePath, []string{"manifest.json", filepath.Join("bin", filepath.Base(bin1))})
+	}
 }
 
 func run(t *testing.T, args ...string) {
@@ -220,6 +226,32 @@ func checkTarGzContains(t *testing.T, tarGzPath string, required []string) {
 		}
 		// Normalise names to forward slashes and strip leading project dir portions
 		name := filepath.ToSlash(hdr.Name)
+		for _, r := range required {
+			r = filepath.ToSlash(r)
+			if strings.HasSuffix(name, r) {
+				found[r] = true
+			}
+		}
+	}
+	for _, r := range required {
+		if !found[filepath.ToSlash(r)] {
+			t.Fatalf("archive missing required entry: %s", r)
+		}
+	}
+}
+
+func checkZipContains(t *testing.T, zipPath string, required []string) {
+	t.Helper()
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip archive: %v", err)
+	}
+	defer zr.Close()
+
+	found := map[string]bool{}
+	for _, f := range zr.File {
+		// Normalise names to forward slashes
+		name := filepath.ToSlash(f.Name)
 		for _, r := range required {
 			r = filepath.ToSlash(r)
 			if strings.HasSuffix(name, r) {
